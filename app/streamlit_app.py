@@ -351,7 +351,7 @@ def render_results(results: dict):
 
         preds_map = out_df.set_index("Test Id")["pred_label"]
         download_df = wide_original.copy()
-        download_df.pop("Is_Valid", None)
+        download_df = download_df.drop(columns=["Is_Valid"], errors="ignore")
         download_df["Predicted Label"] = download_df["Test Id"].map(preds_map)
         download_df["Predicting Model"] = predicting_model
 
@@ -424,8 +424,8 @@ def render_results(results: dict):
                     )
 
                 flag_help = {
-                    "too_sparse": "True if the time-series had too few points after preprocessing.",
-                    "low_resolution": "True if sampling cadence was too coarse to meet the minimum point threshold.",
+                    "too_sparse": "Fewer than min_points (default 3) finite timepoints; curve is not interpolated.",
+                    "low_resolution": "At least min_points but below low_res_threshold (default 7) points; curve exists but time resolution is coarse.",
                     "had_outliers": "True if statistical outlier removal was applied to this curve.",
                 }
                 for flag, nice in [

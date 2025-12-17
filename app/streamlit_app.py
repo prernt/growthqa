@@ -345,12 +345,13 @@ def render_results(results: dict):
         non_time_cols = [
             c
             for c in wide_original.columns
-            if c not in time_cols_original and c not in {"FileName", "Model Name"}
+            if c not in time_cols_original and c not in {"FileName", "Model Name", "Is_Valid"}
         ]
         ordered_non_time = ["Test Id"] + [c for c in non_time_cols if c != "Test Id"]
 
         preds_map = out_df.set_index("Test Id")["pred_label"]
         download_df = wide_original.copy()
+        download_df.pop("Is_Valid", None)
         download_df["Predicted Label"] = download_df["Test Id"].map(preds_map)
         download_df["Predicting Model"] = predicting_model
 

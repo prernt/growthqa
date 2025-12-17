@@ -33,11 +33,12 @@ import sklearn
 
 
 # -----------------------------
-# HARD-CODED PATHS (as requested)
+# Paths (relative to repo root)
 # -----------------------------
-TRAIN_META_CSV = r"C:\Users\prern\Downloads\growthqa\data\train_data\meta.csv"
-ART_DIR = r"C:\Users\prern\Downloads\growthqa\classifier_output\saved_models_selected"
-LOCKFILE_OUT = r"C:\Users\prern\Downloads\growthqa\classifier_output\requirements_lock.txt"
+ROOT = Path(__file__).resolve().parents[3]
+TRAIN_META_CSV = ROOT / "data" / "train_data" / "meta.csv"
+ART_DIR = ROOT / "classifier_output" / "saved_models_selected"
+LOCKFILE_OUT = ROOT / "classifier_output" / "requirements_lock.txt"
 
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
@@ -314,11 +315,10 @@ def main():
     run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     print("Saving run:", run_tag)
 
-    # Save each trained pipeline + manifest
+    # Save each trained pipeline
     for name, model in fitted.items():
         out_path = art_dir / f"{name}_selected_pipeline_{run_tag}.joblib"
         joblib.dump(model, out_path)
-        write_model_manifest(out_path)
         print("Saved:", out_path)
 
     # Save selected features list (critical for inference)
@@ -331,10 +331,6 @@ def main():
     th_path = art_dir / f"thresholds_{run_tag}.json"
     th_path.write_text(json.dumps(thresholds, indent=2), encoding="utf-8")
     print("Saved:", th_path)
-
-    # Save pip-freeze lock for “load forever in pinned env”
-    write_requirements_lock(LOCKFILE_OUT)
-    print("Saved:", LOCKFILE_OUT)
 
     # Save a run summary CSV
     summary_path = art_dir / f"train_results_selected_{run_tag}.csv"

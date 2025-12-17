@@ -4,6 +4,8 @@ from __future__ import annotations
 import io
 import tempfile
 import sys
+import importlib
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -157,7 +159,7 @@ def predict_hard_with_confidence(pipeline, meta_df: pd.DataFrame):
     - confidence = max(predict_proba) if available else NaN
     - also return p_valid if we can identify 'valid' class, else NaN
     """
-    non_features = {"FileName", "Test Id", "Model Name", "Is_Valid"}
+    non_features = {"FileName", "Test Id"}
     X = meta_df.drop(columns=[c for c in meta_df.columns if c in non_features], errors="ignore")
 
     # Align columns to what the pipeline was trained on: drop unseen, add missing as NaN
@@ -226,6 +228,45 @@ def show_friendly_error(exc: Exception):
         unsafe_allow_html=True,
     )
     st.caption(f"Error: {type(exc).__name__}: {exc}")
+
+
+def line_with_tooltip(label: str, value: object, tooltip: str):
+    safe_val = "" if value is None else value
+    icon = (
+        f'<sup style="margin-left:6px;color:#888;" title="{tooltip}">🛈</sup>'
+        if tooltip
+        else ""
+    )
+    st.markdown(
+        f'<div title="{tooltip}"><strong>{label}:</strong> {safe_val}{icon}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def run_training():
+    """
+    Run the training script in-process so artifacts are produced with the same environment
+    as the running Streamlit app. Uses repo-relative defaults and clears old artifacts first.
+    """
+    train_mod = importlib.import_module("growthqa.classifier.train_from_meta")
+    meta_path = ROOT / "data" / "train_data" / "meta.csv"
+    art_dir = ROOT / "classifier_output" / "saved_models_selected"
+    lockfile_out = ROOT / "classifier_output" / "requirements_lock.txt"
+
+    # Clear classifier_output to ensure only fresh artifacts remain
+    clf_root = art_dir.parent
+    if clf_root.exists():
+        for child in clf_root.iterdir():
+            if child.is_file():
+                child.unlink()
+            else:
+                shutil.rmtree(child)
+    clf_root.mkdir(parents=True, exist_ok=True)
+
+    train_mod.TRAIN_META_CSV = str(meta_path)
+    train_mod.ART_DIR = str(art_dir)
+    train_mod.LOCKFILE_OUT = str(lockfile_out)
+    train_mod.main()
 
 
 def to_labeled_excel_bytes(df: pd.DataFrame, sheet_name: str = "Labeled"):
@@ -304,14 +345,14 @@ def render_results(results: dict):
         non_time_cols = [
             c
             for c in wide_original.columns
-            if c not in time_cols_original and c not in {"Is_Valid", "FileName", "Model Name"}
+            if c not in time_cols_original and c not in {"FileName", "Model Name"}
         ]
         ordered_non_time = ["Test Id"] + [c for c in non_time_cols if c != "Test Id"]
 
         preds_map = out_df.set_index("Test Id")["pred_label"]
         download_df = wide_original.copy()
         download_df["Predicted Label"] = download_df["Test Id"].map(preds_map)
-        download_df["PredictingModel"] = predicting_model
+        download_df["Predicting Model"] = predicting_model
 
         final_cols = ordered_non_time + ["Predicted Label"] + time_cols_original + ["PredictingModel"]
         download_df = download_df[[c for c in final_cols if c in download_df.columns]]
@@ -338,9 +379,9 @@ def render_results(results: dict):
     st.subheader("Interactive curve viewer")
 
     if not time_cols_final:
-        st.warning("No time columns found in final_merged for plotting.")
+        st.warning("No time columns found in file for plotting.")
     elif "Test Id" not in final_merged.columns:
-        st.warning("final_merged is missing 'Test Id' column; cannot show curve dropdown.")
+        st.warning("File is missing 'Test Id' column; cannot show curve dropdown.")
     else:
         join_cols = ["Test Id", "pred_label", "pred_confidence"]
         if "p_valid" in out_df.columns:
@@ -362,44 +403,93 @@ def render_results(results: dict):
 
             left, right = st.columns([2, 1])
             with right:
-                st.markdown("### Prediction")
+                st.markdown("### Model decision")
                 st.write(f"**Model:** {predicting_model}")
-                st.write(f"**Label:** {row.get('pred_label', 'NA')}")
-                st.write(f"**Confidence:** {row.get('pred_confidence', np.nan)}")
+                line_with_tooltip(
+                    "Label",
+                    row.get("pred_label", "NA"),
+                    "Predicted validity class for this curve.",
+                )
+                line_with_tooltip(
+                    "Confidence",
+                    row.get("pred_confidence", np.nan),
+                    "Highest class probability; closer to 1 means higher certainty.",
+                )
                 if "p_valid" in final_view.columns:
-                    st.write(f"**p_valid:** {row.get('p_valid', np.nan)}")
+                    line_with_tooltip(
+                        "p_valid",
+                        row.get("p_valid", np.nan),
+                        "Model-reported probability for the 'valid' class when available.",
+                    )
 
-                for flag in ["too_sparse", "low_resolution", "had_outliers"]:
+                flag_help = {
+                    "too_sparse": "True if the time-series had too few points after preprocessing.",
+                    "low_resolution": "True if sampling cadence was too coarse to meet the minimum point threshold.",
+                    "had_outliers": "True if statistical outlier removal was applied to this curve.",
+                }
+                for flag, nice in [
+                    ("too_sparse", "Too sparse"),
+                    ("low_resolution", "Low resolution"),
+                    ("had_outliers", "Outliers removed"),
+                ]:
                     if flag in final_view.columns:
-                        st.write(f"**{flag}:** {bool(row.get(flag))}")
+                        line_with_tooltip(nice, bool(row.get(flag)), flag_help.get(flag, ""))
 
                 st.markdown("---")
                 st.write("**Blank subtraction mode:**")
-                st.write("RAW (applied)" if settings.input_is_raw else "ALREADY (skipped)")
+                st.write("RAW (applied)" if settings.input_is_raw else "ALREADY BLANK SUBTRACTED (so not applied)")
                 if settings.input_is_raw and settings.global_blank is not None:
                     st.write(f"**Global blank used:** {settings.global_blank}")
+                elif settings.input_is_raw:
+                    st.write("**Blank used:** default blank estimation")
 
             with left:
                 st.plotly_chart(make_plot(row, time_cols_final, title=f"Test Id: {chosen}"), use_container_width=True)
 
-    with st.expander("Downloads (debug)", expanded=False):
-        # Meta features subset (no raw/final merged)
-        meta_cols = ["Test Id", "pred_label", "True_A", "True_mu", "True_lam", "initial_OD", "max_slope", "plateau_OD", "auc"]
-        meta_debug = out_df[[c for c in meta_cols if c in out_df.columns]].rename(columns={"pred_label": "Predicted Label"})
-        if not meta_debug.empty:
-            meta_debug["PredictingModel"] = predicting_model
-            st.download_button(
-                label="Download meta_features_debug.csv",
-                data=meta_debug.to_csv(index=False).encode("utf-8"),
-                file_name=f"meta_features_debug_{file_stem}.csv",
-                mime="text/csv",
-            )
-        st.download_button(
-            label="Download feature_plotting_debug.csv",
-            data=final_merged.to_csv(index=False).encode("utf-8"),
-            file_name=f"feature_plotting_{file_stem}.csv",
-            mime="text/csv",
-        )
+        # Full-width aligned expanders
+        col_info, col_dl = st.columns([2, 1])
+        with col_info:
+            with st.expander("How this plot is built", expanded=False):
+                st.markdown(
+                    "- Timepoints are extracted from column headers like `T1.0 (h)` and sorted numerically.\n"
+                    "- Values come from the preprocessed table after interpolation, smoothing, and blank handling.\n"
+                    "- Plot shows the model-ready curve; it should closely match the cleaned measurement trace used for prediction."
+                )
+        with col_dl:
+            with st.expander("Downloads (debug)", expanded=False):
+                # Meta features subset (no raw/final merged)
+                base_meta_cols = [
+                    "Test Id",
+                    "pred_label",
+                    "True_A",
+                    "True_mu",
+                    "True_lam",
+                    "initial_OD",
+                    "max_slope",
+                    "plateau_OD",
+                    "auc",
+                ]
+                meta_debug = out_df[[c for c in base_meta_cols if c in out_df.columns]].rename(columns={"pred_label": "Predicted Label"})
+                feature_plotting = final_merged.drop(columns=["Is_Valid"], errors="ignore")
+                if not meta_debug.empty:
+                    meta_debug["PredictingModel"] = predicting_model
+                    c_meta, c_feat = st.columns(2)
+                    with c_meta:
+                        st.download_button(
+                            label="Download meta_features_debug.csv",
+                            data=meta_debug.to_csv(index=False).encode("utf-8"),
+                            file_name=f"meta_features_debug_{file_stem}.csv",
+                            mime="text/csv",
+                            help="Meta-feature table used for prediction (engineered features + predicted label).",
+                        )
+                    with c_feat:
+                        st.download_button(
+                            label="Download feature_plotting_debug.csv",
+                            data=feature_plotting.to_csv(index=False).encode("utf-8"),
+                            file_name=f"feature_plotting_{file_stem}.csv",
+                            mime="text/csv",
+                            help="Cleaned time-series used for plotting/prediction after preprocessing.",
+                        )
 
 
 # =========================
@@ -409,14 +499,19 @@ st.set_page_config(page_title="GrowthQC - Curve Validator", layout="wide")
 st.title("GrowthQC - Bacterial Growth Curve Validator")
 st.caption("Upload -> preprocess -> meta-features -> predict labels -> download + interactive curve viewer")
 
+# Show any training status messages (persist across reruns)
+train_status = st.session_state.pop("train_status", None)
+if train_status:
+    status_kind, status_msg = train_status
+    if status_kind == "success":
+        st.success(status_msg)
+    else:
+        st.error(status_msg)
+
 with st.sidebar:
     st.header("Model selection")
 
     available_models = discover_models(MODEL_DIR)
-    if not available_models:
-        st.error(f"No .joblib models found in:\n{MODEL_DIR}")
-        st.stop()
-
     def _label_from_stem(stem: str) -> str:
         s = stem.lower()
         if "hgb" in s or "hist" in s:
@@ -434,16 +529,24 @@ with st.sidebar:
             label = f"{label}-{stem}"
         model_label_map[label] = p
 
-    model_options = ["Average"] + sorted(model_label_map.keys())
-    model_name = st.selectbox("Choose trained model or ensemble", options=model_options, index=0)
-    if model_name == "Average":
-        st.caption(f"Loaded ensemble of {len(model_label_map)} models: {', '.join(sorted(model_label_map.keys()))}")
+    model_options: list[str] = []
+    model_name: str | None = None
+    if model_label_map:
+        model_options = ["Average"] + sorted(model_label_map.keys())
+        model_name = st.selectbox("Choose trained model or ensemble", options=model_options, index=0)
+        if model_name == "Average":
+            st.caption(f"Loaded ensemble of {len(model_label_map)} models: {', '.join(sorted(model_label_map.keys()))}")
+        else:
+            model_path = model_label_map[model_name]
+            st.caption(f"Loaded from: `/classifier_output/saved_models_selected`")
     else:
-        model_path = str(model_label_map[model_name])
-        st.caption(f"Loaded from: `{model_path}`")
+        st.warning(
+            f"No .joblib models found.\nRun training below",
+            icon="⚠️",
+        )
 
     st.markdown("---")
-    st.header("Blank subtraction (only setting)")
+    st.header("Blank subtraction settings")
 
     input_is_raw = st.checkbox('Input is raw (apply blank subtraction)', value=False)
 
@@ -456,7 +559,37 @@ with st.sidebar:
         global_blank=_safe_float(global_blank_str, None) if input_is_raw else None,
     )
 
+    st.markdown("---")
+    with st.expander("Training (advanced)", expanded=False):
+        st.caption("Run training here to regenerate models with the current environment. Uses the bundled training data.")
+        enable_train = st.checkbox("Enable training (this may take time)", value=False)
+        train_clicked = st.button(
+            "Run training now",
+            disabled=not enable_train,
+            use_container_width=True,
+            help="Only run if no models are available.",
+        )
+
+        if train_clicked:
+            meta_path = ROOT / "data" / "train_data" / "meta.csv"
+            if not meta_path.exists():
+                st.error("Training data not found at the default location.")
+            else:
+                try:
+                    with st.spinner("Training classifiers..."):
+                        run_training()
+                    st.session_state["train_status"] = ("success", "Training complete. Models refreshed.")
+                    st.rerun()  # refresh model dropdown with new artifacts
+                except Exception as e:
+                    st.session_state["train_status"] = ("error", f"Training failed: {e}")
+                    st.rerun()
+
 st.markdown("---")
+
+# If no models are available, stop before main workflow; training expander above can generate them.
+if not model_label_map:
+    st.info("No models available yet. Run training from the sidebar (advanced).", icon="ℹ️")
+    st.stop()
 
 uploaded = st.file_uploader(
     "Upload file (Excel .xlsx or CSV .csv) in your defined format",

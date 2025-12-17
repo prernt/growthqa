@@ -39,7 +39,7 @@ from growthqa.pipelines.build_meta_dataset import run_merge_preprocess_meta
 # -------------------------
 # User paths (as requested)
 # -------------------------
-MODEL_DIR = r"C:\Users\prern\Downloads\growthqa\classifier_output\saved_models_selected"
+MODEL_DIR = ROOT / "classifier_output" / "saved_models_selected"
 
 
 # =========================

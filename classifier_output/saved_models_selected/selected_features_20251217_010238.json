@@ -1,0 +1,10 @@
+[
+  "auc",
+  "max_slope",
+  "growth_phase_duration",
+  "dip_fraction",
+  "symmetry_factor",
+  "noise_residual_std",
+  "best_model_AIC",
+  "multi_phase_flag"
+]

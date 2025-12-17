@@ -89,11 +89,13 @@ def assert_runtime_matches_model(model_path: str):
         problems.append(f"joblib {joblib.__version__} != trained {m.get('joblib_version')}")
 
     if problems:
-        raise RuntimeError(
-            "This model cannot be loaded in the current environment.\n"
+        # On mismatches (common when deploying on a newer Python), log a warning but continue
+        warn_msg = (
+            "Model/runtime version mismatch detected:\n"
             + "\n".join(["- " + p for p in problems])
-            + "\n\nUse run_app_windows.bat (it uses the pinned environment)."
+            + "\nProceeding anyway; retrain or regenerate models to silence this warning."
         )
+        print(warn_msg, file=sys.stderr)
 
 def _safe_float(x, default=None):
     try:
@@ -223,7 +225,7 @@ def show_friendly_error(exc: Exception):
         """,
         unsafe_allow_html=True,
     )
-    st.caption(f"Error: {type(exc).__name__}")
+    st.caption(f"Error: {type(exc).__name__}: {exc}")
 
 
 def to_labeled_excel_bytes(df: pd.DataFrame, sheet_name: str = "Labeled"):

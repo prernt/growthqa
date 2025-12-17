@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "GrowthQC: preprocessing, metadata extraction and classification of bacterial growth curves"
 authors = [{ name = "Prerna Thapliyal" }]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.9,<3.13"
 
 dependencies = [
     "numpy",

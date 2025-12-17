@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "growthqa"
+version = "0.1.0"
+description = "GrowthQC: preprocessing, metadata extraction and classification of bacterial growth curves"
+authors = [{ name = "Prerna Thapliyal" }]
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "statsmodels",
+    "scikit-learn",
+    "joblib",
+    "openpyxl",
+    "matplotlib",
+    "plotly",
+    "streamlit"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

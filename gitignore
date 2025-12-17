@@ -1,4 +1,38 @@
+# Virtual envs
+.venv/
+.venv_infer/
+venv/
+env/
+
+# Python caches
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+
+# Build/dist
+build/
+dist/
+*.egg-info/
+
+# Data and outputs
+*.log
+*.tmp
+/tmp/
+
+# Notebooks
 .ipynb_checkpoints/
+
+# CSV/XLSX (except tracked samples)
 *.csv
-*.h5
+*.xlsx
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/cache/
+.streamlit/**/cache/
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db

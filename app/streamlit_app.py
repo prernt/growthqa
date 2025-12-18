@@ -616,7 +616,7 @@ if not model_label_map:
     st.stop()
 
 uploaded = st.file_uploader(
-    "Upload file (Excel .xlsx or CSV .csv) in your defined format",
+    "Upload file (Excel .xlsx or CSV .csv) in your defined format. CSV Preferred",
     type=["xlsx", "csv"],
     accept_multiple_files=False,
 )

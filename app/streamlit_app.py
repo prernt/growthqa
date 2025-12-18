@@ -65,7 +65,7 @@ class InferenceSettings:
     clip_negatives: bool = False
     smooth_method: str = "SGF"   # Savitzky-Golay smoothing as default
     smooth_window: int = 5
-    normalize: str = "MAX"       # scale curves to max=1
+    normalize: str = "MINMAX"       # scale curves to max=1
 
 
 # =========================
@@ -130,7 +130,7 @@ def make_plot(df_one: pd.Series, time_cols: list[str], title: str):
     fig.update_layout(
         title=title,
         xaxis_title="Time (hours)",
-        yaxis_title="OD",
+        yaxis_title="Relative OD (normalized)",
         height=420,
         margin=dict(l=30, r=10, t=50, b=40),
     )
@@ -321,10 +321,18 @@ def render_results(results: dict):
         st.metric("Invalid", int((out_df["pred_label"] == "Invalid").sum()))
 
     st.subheader("Predictions table")
-    pretty_cols = ["Test Id", "pred_label", "pred_confidence"]
+    pretty_cols = ["Test Id", "pred_label", "confidence_valid", "confidence_invalid"]
     pretty = out_df[pretty_cols].rename(
-        columns={"pred_label": "Predicted label", "pred_confidence": "Predicted confidence"}
+        columns={
+            "pred_label": "Predicted label",
+            "confidence_valid": "Confidence (Valid)",
+            "confidence_invalid": "Confidence (Invalid)",
+        }
     )
+    # Streamlit right-aligns numeric columns; format confidences as strings to keep left alignment like other columns.
+    for c in ["Confidence (Valid)", "Confidence (Invalid)"]:
+        if c in pretty.columns:
+            pretty[c] = pretty[c].map(lambda v: "" if pd.isna(v) else f"{float(v):.4f}")
     st.data_editor(
         pretty,
         use_container_width=True,
@@ -350,12 +358,24 @@ def render_results(results: dict):
         ordered_non_time = ["Test Id"] + [c for c in non_time_cols if c != "Test Id"]
 
         preds_map = out_df.set_index("Test Id")["pred_label"]
+        conf_valid_map = out_df.set_index("Test Id")["confidence_valid"] if "confidence_valid" in out_df.columns else None
+        conf_invalid_map = out_df.set_index("Test Id")["confidence_invalid"] if "confidence_invalid" in out_df.columns else None
         download_df = wide_original.copy()
         download_df = download_df.drop(columns=["Is_Valid"], errors="ignore")
         download_df["Predicted Label"] = download_df["Test Id"].map(preds_map)
+        if conf_valid_map is not None:
+            download_df["Confidence (Valid)"] = download_df["Test Id"].map(conf_valid_map)
+        if conf_invalid_map is not None:
+            download_df["Confidence (Invalid)"] = download_df["Test Id"].map(conf_invalid_map)
         download_df["Predicting Model"] = predicting_model
+        download_df = download_df.drop(columns=["pred_confidence"], errors="ignore")
 
-        final_cols = ordered_non_time + ["Predicted Label"] + time_cols_original + ["PredictingModel"]
+        final_cols = (
+            ordered_non_time
+            + ["Predicted Label", "Confidence (Valid)", "Confidence (Invalid)"]
+            + time_cols_original
+            + ["Predicting Model"]
+        )
         download_df = download_df[[c for c in final_cols if c in download_df.columns]]
 
         st.markdown("**Download predictions with original columns**")
@@ -384,7 +404,7 @@ def render_results(results: dict):
     elif "Test Id" not in final_merged.columns:
         st.warning("File is missing 'Test Id' column; cannot show curve dropdown.")
     else:
-        join_cols = ["Test Id", "pred_label", "pred_confidence"]
+        join_cols = ["Test Id", "pred_label", "pred_confidence", "confidence_valid", "confidence_invalid"]
         if "p_valid" in out_df.columns:
             join_cols.append("p_valid")
 
@@ -454,6 +474,7 @@ def render_results(results: dict):
                 st.markdown(
                     "- Timepoints are extracted from column headers like `T1.0 (h)` and sorted numerically.\n"
                     "- Values come from the preprocessed table after interpolation, smoothing, and blank handling.\n"
+                    "- Y-axis is **Relative OD (normalized)** (each curve is scaled so its maximum is 1.0 by default), which makes shapes comparable across curves.\n"
                     "- Plot shows the model-ready curve; it should closely match the cleaned measurement trace used for prediction."
                 )
         with col_dl:
@@ -462,6 +483,8 @@ def render_results(results: dict):
                 base_meta_cols = [
                     "Test Id",
                     "pred_label",
+                    "confidence_valid",
+                    "confidence_invalid",
                     "True_A",
                     "True_mu",
                     "True_lam",
@@ -731,6 +754,18 @@ if run:
                 out_df = meta.copy()
                 out_df["pred_label"] = final_label
                 out_df["pred_confidence"] = np.round(final_conf, 4)
+                out_df["confidence_valid"] = np.round(final_prob, 4)
+                out_df["confidence_invalid"] = np.round(1 - final_prob, 4)
+
+                # Hard rule: if too_sparse is True, mark as UNSURE and set confidence values to 100.
+                # This prevents misleading "Valid/Invalid" predictions on extremely sparse curves.
+                if "too_sparse" in out_df.columns:
+                    sparse_mask = out_df["too_sparse"].astype(bool)
+                    if sparse_mask.any():
+                        out_df.loc[sparse_mask, "pred_label"] = "Unsure"
+                        out_df.loc[sparse_mask, "pred_confidence"] = 100.0
+                        out_df.loc[sparse_mask, "confidence_valid"] = 100.0
+                        out_df.loc[sparse_mask, "confidence_invalid"] = 100.0
 
                 time_cols_final = [c for c in final_merged.columns if isinstance(c, str) and c.strip().startswith("T") and "(h)" in c]
 

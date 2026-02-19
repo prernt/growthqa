@@ -195,8 +195,28 @@ def preprocess_wide(raw_wide: pd.DataFrame,
                     normalize_mode: str) -> Tuple[pd.DataFrame, pd.Series]:
     # adjust blank_subtracted per-file if needed
 
-    meta_cols = ["FileName", "Test Id", "Model Name", "Is_Valid", "too_sparse", "low_resolution"]
-    time_cols = [c for c in raw_wide.columns if c not in meta_cols]
+    if blank_status_map is None:
+        blank_status_map = {}
+
+    base_meta_cols = [
+        "FileName",
+        "Test Id",
+        "Model Name",
+        "Is_Valid",
+        "too_sparse",
+        "low_resolution",
+        "base_curve_id",
+        "aug_id",
+        "train_horizon",
+        "tmax_original",
+        "is_censored",
+        "source_type",
+        "is_synthetic",
+    ]
+    meta_cols = [c for c in base_meta_cols if c in raw_wide.columns]
+    if "Concentration" in raw_wide.columns and "Concentration" not in meta_cols:
+        meta_cols.append("Concentration")
+    time_cols = [c for c in raw_wide.columns if parse_time_from_header(str(c)) is not None]
     t_grid = np.array([parse_time_from_header(c) for c in time_cols], dtype=float)
 
     out = raw_wide.copy()
@@ -258,14 +278,21 @@ def preprocess_wide(raw_wide: pd.DataFrame,
         had_outliers.append(flag)
 
         # now apply preprocessing
-        y1 = y0
-        y2 = smooth_curve(t_grid, y1, method=smooth_method, window=int(smooth_window))
-        y3 = normalize_curve(y2, mode=normalize_mode)
+        # Apply transformations strictly on observed points to avoid borrowing
+        # any information from NaN tails beyond the observed horizon.
+        y3 = y0.copy()
+        obs = np.isfinite(y0) & np.isfinite(t_grid)
+        if np.any(obs):
+            t_obs = t_grid[obs]
+            y_obs = y0[obs]
+            y_obs = smooth_curve(t_obs, y_obs, method=smooth_method, window=int(smooth_window))
+            y_obs = normalize_curve(y_obs, mode=normalize_mode)
+            y3[obs] = y_obs
 
         out.loc[i, time_cols] = y3
 
     out["had_outliers"] = pd.Series(had_outliers, index=out.index).astype(bool)
 
     # keep had_outliers adjacent to flags
-    cols = ["FileName", "Test Id", "Model Name", "Is_Valid", "too_sparse", "low_resolution", "had_outliers"] + time_cols
+    cols = meta_cols + ["had_outliers"] + time_cols
     return out[cols], out["had_outliers"]

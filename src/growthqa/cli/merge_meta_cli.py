@@ -22,7 +22,7 @@ def add_merge_meta_subcommand(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("inputs", nargs="+", help="Input CSV(s), already converted to wide format.")
 
     # interpolation / grid
-    p.add_argument("--step", type=float, default=0.25, help="Common grid step (hours). Default 0.25.")
+    p.add_argument("--step", type=float, default=0.5, help="Common grid step (hours). Default 0.5.")
     p.add_argument("--min-points", type=int, default=3, help="Min finite points required to interpolate. Default 3.")
     p.add_argument(
         "--low-res-threshold",
@@ -34,9 +34,16 @@ def add_merge_meta_subcommand(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--auto-tmax",
         action="store_true",
-        default=True,
+        default=False,
         help="If set, choose tmax so >=coverage fraction of curves reach it.",
     )
+    p.add_argument(
+    "--no-auto-tmax",
+    action="store_true",
+    default=False,
+    help="Disable auto-tmax (use --tmax-hours or infer from columns).",
+    )
+
     p.add_argument(
         "--auto-tmax-coverage",
         type=float,
@@ -72,7 +79,7 @@ def add_merge_meta_subcommand(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--blank-default",
         type=str,
-        default="RAW",
+        default="ALREADY",
         choices=["RAW", "ALREADY"],
         help="Default blank status if FileName not in blank-status-csv.",
     )
@@ -110,6 +117,12 @@ def add_merge_meta_subcommand(subparsers: argparse._SubParsersAction) -> None:
         help="Logging level.",
     )
 
+    p.add_argument("--augment-trunc", action="store_true", default=False)
+    p.add_argument("--trunc-horizons", nargs="+", type=float, default=[8, 10, 12, 14.75, 16])
+    p.add_argument("--trunc-per-curve", type=int, default=3)
+    p.add_argument("--trunc-seed", type=int, default=123)
+    p.add_argument("--rich-meta", action="store_true", default=False, help="Include expensive parametric model-fit features.")
+
     p.set_defaults(_fn=_run_merge_meta)
 
 
@@ -130,7 +143,7 @@ def _run_merge_meta(args: argparse.Namespace) -> int:
         min_points=int(args.min_points),
         low_res_threshold=int(args.low_res_threshold),
         tmax_hours=args.tmax_hours,
-        auto_tmax=bool(args.auto_tmax),
+        auto_tmax=args.auto_tmax and (not args.no_auto_tmax),
         auto_tmax_coverage=float(args.auto_tmax_coverage),
         blank_subtracted=bool(args.blank_subtracted),
         clip_negatives=bool(args.clip_negatives),
@@ -141,5 +154,11 @@ def _run_merge_meta(args: argparse.Namespace) -> int:
         smooth_window=int(args.smooth_window),
         normalize=str(args.normalize).upper(),
         loglevel=str(args.loglevel).upper(),
+        augment_trunc=args.augment_trunc,
+        trunc_horizons=args.trunc_horizons,
+        trunc_per_curve=args.trunc_per_curve,
+        trunc_seed=args.trunc_seed,
+        rich_meta=bool(args.rich_meta),
+
     )
     return 0

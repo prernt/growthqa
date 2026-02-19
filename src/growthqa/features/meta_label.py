@@ -31,7 +31,13 @@ except Exception:
 def compute_label_thresholds(meta_df: pd.DataFrame) -> Dict[str, float]:
     # data-adaptive thresholds (do NOT depend on Is_Valid)
     df = meta_df.copy()
-    df = df[~df["too_sparse"]].copy()
+    if "too_sparse" in df.columns:
+        sparse = df["too_sparse"]
+        if sparse.dtype == bool:
+            mask = ~sparse
+        else:
+            mask = pd.to_numeric(sparse, errors="coerce").fillna(0).astype(int) == 0
+        df = df[mask].copy()
     if len(df) < 20:
         return {
             "max_slope_p99": 1.0,

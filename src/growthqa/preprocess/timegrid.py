@@ -24,7 +24,13 @@ def parse_time_from_header(col: str) -> Optional[float]:
 
 
 def make_header_from_times(t_grid: np.ndarray) -> List[str]:
-    return [f"T{t:.2f} (h)" for t in t_grid]
+    headers: List[str] = []
+    for t in t_grid:
+        ts = f"{float(t):.2f}".rstrip("0").rstrip(".")
+        if "." not in ts:
+            ts = f"{ts}.0"
+        headers.append(f"T{ts} (h)")
+    return headers
 
 
 def get_time_columns(df: pd.DataFrame) -> List[str]:
@@ -37,6 +43,18 @@ def get_time_columns(df: pd.DataFrame) -> List[str]:
 def build_common_grid(all_times: np.ndarray, step_hours: float, tmax_hours: Optional[float]) -> np.ndarray:
     all_times = np.array(all_times, dtype=float)
     all_times = all_times[np.isfinite(all_times)]
+    if tmax_hours is not None:
+        # Canonical mode: force 0..tmax even when observed curves are shorter.
+        tmin = 0.0
+        tmax = float(tmax_hours)
+        if tmax < tmin:
+            tmax = tmin
+        n = int(np.floor((tmax - tmin) / step_hours + 1e-9)) + 1
+        grid = tmin + step_hours * np.arange(n, dtype=float)
+        if grid.size == 0:
+            grid = np.array([0.0], dtype=float)
+        return grid
+
     if all_times.size == 0:
         return np.array([0.0], dtype=float)
 
@@ -45,9 +63,6 @@ def build_common_grid(all_times: np.ndarray, step_hours: float, tmax_hours: Opti
         tmin = 0.0
 
     tmax = float(np.nanmax(all_times))
-    if tmax_hours is not None:
-        tmax = min(tmax, float(tmax_hours))
-
     n = int(np.floor((tmax - tmin) / step_hours + 1e-9)) + 1
     grid = tmin + step_hours * np.arange(n, dtype=float)
     if grid.size == 0:

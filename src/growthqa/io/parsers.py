@@ -114,20 +114,36 @@ def convert_simple_wide_to_long(df: pd.DataFrame, file_stem: str) -> Optional[pd
     if mode != "synthetic":
         return None
 
-    meta = ["FileName", "Test Id", "Model Name", "Is_Valid"]
-    have_meta = [c for c in meta if c in df.columns]
+    conc_col = None
+    for c in df.columns:
+        cl = str(c).strip().lower()
+        if cl in {"concentration", "conc", "dose", "drug_conc"}:
+            conc_col = c
+            break
+
     out = df.copy()
-    if len(have_meta) < 2:
+    # Ensure required metadata columns exist independently.
+    if "FileName" not in out.columns:
         out["FileName"] = file_stem
-        if "Test Id" not in out.columns:
-            out["Test Id"] = out.index.astype(str)
-        if "Model Name" not in out.columns:
-            out["Model Name"] = out["Test Id"]
-        if "Is_Valid" not in out.columns:
-            out["Is_Valid"] = True
+    if "Test Id" not in out.columns:
+        out["Test Id"] = out.index.astype(str)
+    if "Model Name" not in out.columns:
+        out["Model Name"] = out["Test Id"]
+    if "Is_Valid" not in out.columns:
+        out["Is_Valid"] = True
+    else:
+        # Blank labels in uploaded lab files should default to valid during inference upload parsing.
+        out["Is_Valid"] = out["Is_Valid"].fillna(True)
+
+    if conc_col is not None and conc_col != "Concentration":
+        out = out.rename(columns={conc_col: "Concentration"})
+
+    id_vars = ["FileName", "Test Id", "Model Name", "Is_Valid"]
+    if "Concentration" in out.columns:
+        id_vars.append("Concentration")
 
     long = out.melt(
-        id_vars=["FileName", "Test Id", "Model Name", "Is_Valid"],
+        id_vars=id_vars,
         value_vars=tcols,
         var_name="time_col",
         value_name="OD",

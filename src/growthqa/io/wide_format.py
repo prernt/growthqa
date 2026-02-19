@@ -22,6 +22,10 @@ def long_to_wide_preserve_times(df_long: pd.DataFrame, file_tag: str, add_prefix
     Convert standardized long -> wide, preserving exact unique time_h values.
     """
     df = df_long.copy()
+    if "Is_Valid" not in df.columns:
+        df["Is_Valid"] = True
+    else:
+        df["Is_Valid"] = df["Is_Valid"].fillna(True)
 
     # stable per-file curve id
     if add_prefix:
@@ -30,11 +34,14 @@ def long_to_wide_preserve_times(df_long: pd.DataFrame, file_tag: str, add_prefix
         df["Test Id"] = df["orig_TestId"].astype(str)
 
     # average duplicates at same time
-    df = df.groupby(["FileName", "Test Id", "Model Name", "Is_Valid", "time_h"], as_index=False)["OD"].mean()
+    group_cols = ["FileName", "Test Id", "Model Name", "Is_Valid", "time_h"]
+    if "Concentration" in df.columns:
+        group_cols.insert(3, "Concentration")
+    df = df.groupby(group_cols, as_index=False, dropna=False)["OD"].mean()
 
     # pivot
     wide = df.pivot_table(
-        index=["FileName", "Test Id", "Model Name", "Is_Valid"],
+        index=[c for c in group_cols if c != "time_h"],
         columns="time_h",
         values="OD",
         aggfunc="mean"

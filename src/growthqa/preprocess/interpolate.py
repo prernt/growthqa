@@ -15,11 +15,29 @@ from growthqa.preprocess.timegrid import build_common_grid, choose_auto_tmax, ge
 
 REQUIRED_META_COLS = ["FileName", "Test Id", "Model Name", "Is_Valid"]
 
+def _get_meta_cols(df_wide: pd.DataFrame) -> List[str]:
+    cols = list(REQUIRED_META_COLS)
+    if "Concentration" in df_wide.columns:
+        cols.insert(3, "Concentration")
+    for c in [
+        "base_curve_id",
+        "aug_id",
+        "train_horizon",
+        "tmax_original",
+        "is_censored",
+        "source_type",
+        "is_synthetic",
+    ]:
+        if c in df_wide.columns and c not in cols:
+            cols.append(c)
+    return cols
+
 
 def wide_to_long(df_wide: pd.DataFrame) -> pd.DataFrame:
     tcols = get_time_columns(df_wide)
+    meta_cols = _get_meta_cols(df_wide)
     long = df_wide.melt(
-        id_vars=REQUIRED_META_COLS,
+        id_vars=meta_cols,
         value_vars=tcols,
         var_name="time_col",
         value_name="OD",
@@ -87,9 +105,13 @@ def build_raw_merged(df_all_wide: pd.DataFrame,
     time_headers = make_header_from_times(t_grid)
 
     rows = []
-    grouped = long.groupby(REQUIRED_META_COLS, sort=True, dropna=False)
+    meta_cols = _get_meta_cols(df_all_wide)
+    grouped = long.groupby(meta_cols, sort=True, dropna=False)
 
-    for (fname, tid, mname, is_valid), grp in grouped:
+    for keys, grp in grouped:
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        meta = dict(zip(meta_cols, keys))
         t_src = grp["time_h"].to_numpy(dtype=float)
         y_src = grp["OD"].to_numpy(dtype=float)
 
@@ -104,19 +126,12 @@ def build_raw_merged(df_all_wide: pd.DataFrame,
             if not too_sparse else np.full_like(t_grid, np.nan, dtype=float)
         )
 
-        row = {
-            "FileName": fname,
-            "Test Id": tid,
-            "Model Name": mname,
-            "Is_Valid": bool(is_valid),  # keep as-is
-            "too_sparse": bool(too_sparse),
-            "low_resolution": bool(low_resolution),
-        }
+        row = {**meta, "too_sparse": bool(too_sparse), "low_resolution": bool(low_resolution)}
         for h, v in zip(time_headers, y_grid):
             row[h] = float(v) if np.isfinite(v) else np.nan
 
         rows.append(row)
 
-    cols = ["FileName", "Test Id", "Model Name", "Is_Valid", "too_sparse", "low_resolution"] + time_headers
+    cols = meta_cols + ["too_sparse", "low_resolution"] + time_headers
     return pd.DataFrame(rows)[cols]
 

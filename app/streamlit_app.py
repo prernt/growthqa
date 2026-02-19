@@ -293,6 +293,10 @@ def make_overlay_plot_payload(
         params = spline.get("params", {})
         t_mu = _to_numeric_scalar(params.get("t_mu"))
         y_mu = _to_numeric_scalar(params.get("y_mu"))
+        mu = _to_numeric_scalar(params.get("mu"))
+        lam = _to_numeric_scalar(params.get("lambda"))
+        y0 = _to_numeric_scalar(params.get("y0"))
+        A = _to_numeric_scalar(params.get("A"))
         if np.isfinite(t_mu) and np.isfinite(y_mu):
             fig.add_trace(
                 go.Scatter(
@@ -304,11 +308,36 @@ def make_overlay_plot_payload(
                     textposition="top center",
                 )
             )
-        lam = _to_numeric_scalar(params.get("lambda"))
+        # Tangent at max growth using y = mu * (t - lambda), drawn over the
+        # approximate exponential phase for visual slope verification.
+        if np.isfinite(mu) and np.isfinite(lam) and abs(float(mu)) > 1e-12:
+            t_grid = np.asarray(spline.get("t_grid", []), dtype=float)
+            y_hat = np.asarray(spline.get("y_hat", []), dtype=float)
+            x_min = float(np.nanmin(t_grid)) if t_grid.size else float(np.nanmin(t_proc)) if len(t_proc) else float(lam)
+            x_max = float(np.nanmax(t_grid)) if t_grid.size else float(np.nanmax(t_proc)) if len(t_proc) else float(lam + 1.0)
+            if np.isfinite(y0) and np.isfinite(A) and t_grid.size and y_hat.size and A > 0:
+                y_lo = float(y0 + 0.1 * A)
+                y_hi = float(y0 + 0.9 * A)
+                mask = np.isfinite(t_grid) & np.isfinite(y_hat) & (y_hat >= y_lo) & (y_hat <= y_hi)
+                if np.any(mask):
+                    x_min = float(np.nanmin(t_grid[mask]))
+                    x_max = float(np.nanmax(t_grid[mask]))
+            x_min = max(x_min, float(np.nanmin(t_proc)) if len(t_proc) else x_min)
+            x_max = min(x_max, float(np.nanmax(t_proc)) if len(t_proc) else x_max)
+            if x_max > x_min:
+                x_line = np.array([x_min, x_max], dtype=float)
+                y_line = mu * (x_line - lam)
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_line,
+                        y=y_line,
+                        mode="lines",
+                        name="Tangent (mu)",
+                        line=dict(color="#8b4513", width=2),
+                    )
+                )
         if np.isfinite(lam):
             fig.add_vline(x=float(lam), line_dash="dot", line_color="#7a6a5f")
-        y0 = _to_numeric_scalar(params.get("y0"))
-        A = _to_numeric_scalar(params.get("A"))
         if np.isfinite(y0):
             fig.add_hline(y=float(y0), line_dash="dot", line_color="#7a6a5f")
         if np.isfinite(y0) and np.isfinite(A) and np.isfinite(t_mu):
@@ -2198,6 +2227,12 @@ def render_results(results: dict):
                 reviewed_key,
             )
             reviewed_bool = reviewed_val == "True"
+            label_reason_raw = out_row.get("Label Reason", row.get("Label Reason", ""))
+            label_reason_txt = ""
+            if label_reason_raw is not None and not (isinstance(label_reason_raw, float) and pd.isna(label_reason_raw)):
+                label_reason_txt = str(label_reason_raw).strip()
+            if label_reason_txt:
+                _render_row("Label Reason", label_reason_txt)
 
             if new_final != _normalize_label(row.get("true_label", row.get("final_label", pred_label))) or reviewed_bool != bool(row.get("Reviewed", False)):
                 review_df.loc[review_df["CurveKey"] == curve_key, "true_label"] = new_final

@@ -1,8 +1,5 @@
 # apps/streamlit_app.py
 from __future__ import annotations
-from growthqa.grofit.pipeline import run_grofit_pipeline
-from growthqa.classifier.train_from_meta import NOTEBOOK_STAGE1_CUSTOM_FEATURES
-import growthqa.pipelines.auto_train_classifier as _auto_train_mod
 
 
 
@@ -40,6 +37,9 @@ for cand in {
         if sp not in sys.path:
             sys.path.insert(0, sp)
 
+from growthqa.grofit.pipeline import run_grofit_pipeline
+from growthqa.classifier.train_from_meta import NOTEBOOK_STAGE1_CUSTOM_FEATURES
+import growthqa.pipelines.auto_train_classifier as _auto_train_mod
 from growthqa.preprocess.timegrid import parse_time_from_header
 from growthqa.io.wide_format import long_to_wide_preserve_times, parse_any_file_to_long
 from growthqa.io.audit import build_classifier_audit_df

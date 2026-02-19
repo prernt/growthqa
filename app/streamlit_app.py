@@ -2107,21 +2107,66 @@ def render_results(results: dict):
             parametric = curve_payload.get("parametric", {})
             param_params = parametric.get("params", {})
             boot_ci = curve_payload.get("bootstrap", {}).get("ci", {})
+            has_boot_vals = boot_row is not None and any(
+                pd.notna(boot_row.get(k, np.nan)) for k in ["mu.bt", "lambda.bt", "A.bt", "integral.bt"]
+            )
+            model_name = str(parametric.get("model_name") or "Model")
 
-            p_left, p_right = st.columns(2)
-            p_left.markdown("**Spline**")
-            p_left.markdown(f"μ: {_fmt_ci_metric(spline_params.get('mu'), boot_ci.get('mu'))}")
-            p_left.markdown(f"λ: {_fmt_ci_metric(spline_params.get('lambda'), boot_ci.get('lambda'))}")
-            p_left.markdown(f"A: {_fmt_ci_metric(spline_params.get('A'), boot_ci.get('A'))}")
-            p_left.markdown(f"Integral: {_fmt_ci_metric(spline_params.get('integral'), boot_ci.get('integral'))}")
+            rows_html = [
+                (
+                    "&mu;",
+                    _fmt_ci_metric(spline_params.get("mu"), boot_ci.get("mu")),
+                    _fmt_metric(param_params.get("mu")),
+                    _fmt_metric(boot_row.get("mu.bt")) if has_boot_vals else None,
+                ),
+                (
+                    "&lambda;",
+                    _fmt_ci_metric(spline_params.get("lambda"), boot_ci.get("lambda")),
+                    _fmt_metric(param_params.get("lambda")),
+                    _fmt_metric(boot_row.get("lambda.bt")) if has_boot_vals else None,
+                ),
+                (
+                    "A",
+                    _fmt_ci_metric(spline_params.get("A"), boot_ci.get("A")),
+                    _fmt_metric(param_params.get("A")),
+                    _fmt_metric(boot_row.get("A.bt")) if has_boot_vals else None,
+                ),
+                (
+                    "Integral",
+                    _fmt_ci_metric(spline_params.get("integral"), boot_ci.get("integral")),
+                    _fmt_metric(param_params.get("integral")),
+                    _fmt_metric(boot_row.get("integral.bt")) if has_boot_vals else None,
+                ),
+            ]
 
-            model_name = parametric.get("model_name") or "Model"
-            p_right.markdown(f"**{model_name}**")
-            p_right.markdown(f"μ: {_fmt_metric(param_params.get('mu'))}")
-            p_right.markdown(f"λ: {_fmt_metric(param_params.get('lambda'))}")
-            p_right.markdown(f"A: {_fmt_metric(param_params.get('A'))}")
-            p_right.markdown(f"Integral: {_fmt_metric(param_params.get('integral'))}")
+            header_boot = "<th style='border:1px solid #8f8f8f;padding:4px 6px;text-align:left;'>Bootstrap</th>" if has_boot_vals else ""
+            body = []
+            for metric, spline_v, model_v, boot_v in rows_html:
+                boot_cell = f"<td style='border:1px solid #8f8f8f;padding:3px 6px;'>{boot_v}</td>" if has_boot_vals else ""
+                body.append(
+                    "<tr>"
+                    f"<td style='border:1px solid #8f8f8f;padding:3px 6px;'>{metric}</td>"
+                    f"<td style='border:1px solid #8f8f8f;padding:3px 6px;'>{spline_v}</td>"
+                    f"<td style='border:1px solid #8f8f8f;padding:3px 6px;'>{model_v}</td>"
+                    f"{boot_cell}"
+                    "</tr>"
+                )
 
+            st.markdown(
+                (
+                    "<table style='width:100%;border-collapse:collapse;border:1px solid #8f8f8f;margin:70px 0 20px 0;'>"
+                    "<thead><tr>"
+                    "<th style='border:1px solid #8f8f8f;padding:4px 6px;text-align:left;width:20%;'>Metric</th>"
+                    "<th style='border:1px solid #8f8f8f;padding:4px 6px;text-align:left;'>Spline</th>"
+                    f"<th style='border:1px solid #8f8f8f;padding:4px 6px;text-align:left;'>{model_name}</th>"
+                    f"{header_boot}"
+                    "</tr></thead>"
+                    "<tbody>"
+                    + "".join(body)
+                    + "</tbody></table>"
+                ),
+                unsafe_allow_html=True,
+            )
         _render_row("Predicted Label", _fmt_val(pred_label))
 
         if manual_review_mode and isinstance(review_df, pd.DataFrame) and not review_df.empty:
@@ -2185,20 +2230,6 @@ def render_results(results: dict):
         # keep the rest of your existing metrics rows as-is:
         pred_conf_text = "" if pred_label.strip().lower() == "unsure" else _fmt_metric(pred_conf_display)
         _render_row(f"Confidence ({pred_label})", pred_conf_text)
-        _render_row("Use.model", _fmt_metric(fit_row.get("use.model") if fit_row is not None else None))
-        _render_row("mu.spline", _fmt_metric(fit_row.get("mu.spline") if fit_row is not None else None))
-        _render_row("lambda.spline", _fmt_metric(fit_row.get("lambda.spline") if fit_row is not None else None))
-        _render_row("A.spline", _fmt_metric(fit_row.get("A.nonpara") if fit_row is not None else None))
-        _render_row("integral.spline", _fmt_metric(fit_row.get("integral.spline") if fit_row is not None else None))
-        _render_row("mu.model", _fmt_metric(fit_row.get("mu.model") if fit_row is not None else None))
-        _render_row("lambda.model", _fmt_metric(fit_row.get("lambda.model") if fit_row is not None else None))
-        _render_row("A.model", _fmt_metric(fit_row.get("A.para") if fit_row is not None else None))
-        _render_row("Integral.model", _fmt_metric(fit_row.get("Integral.model") if fit_row is not None else None))
-        if not manual_review_mode:
-            _render_row("mu.bt", _fmt_metric(boot_row.get("mu.bt") if boot_row is not None else None))
-            _render_row("lambda.bt", _fmt_metric(boot_row.get("lambda.bt") if boot_row is not None else None))
-            _render_row("A.bt", _fmt_metric(boot_row.get("A.bt") if boot_row is not None else None))
-            _render_row("integral.bt", _fmt_metric(boot_row.get("integral.bt") if boot_row is not None else None))
         _render_row("Too Sparse", _fmt_val(bool(out_row.get("too_sparse")) if "too_sparse" in out_row else "NA"))
         _render_row("Low Resolution", _fmt_val(bool(out_row.get("low_resolution")) if "low_resolution" in out_row else "NA"))
         _render_row(

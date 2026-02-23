@@ -132,6 +132,7 @@ def build_classifier_audit_df(
     meta_df: pd.DataFrame,
     mode: str,
     review_df: pd.DataFrame | None = None,
+    processed_wide_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     mode_u = str(mode).strip().upper()
     manual_mode = mode_u == "MANUAL"
@@ -139,6 +140,7 @@ def build_classifier_audit_df(
     wide = _with_curve_id(wide_original_df if isinstance(wide_original_df, pd.DataFrame) else pd.DataFrame())
     infer = _with_curve_id(infer_df if isinstance(infer_df, pd.DataFrame) else pd.DataFrame())
     meta = _with_curve_id(meta_df if isinstance(meta_df, pd.DataFrame) else pd.DataFrame())
+    proc = _with_curve_id(processed_wide_df if isinstance(processed_wide_df, pd.DataFrame) else pd.DataFrame())
 
     if wide.empty:
         return pd.DataFrame()
@@ -192,6 +194,21 @@ def build_classifier_audit_df(
         meta_cols = [c for c in _unique_cols(AUDIT_META_FEATURES) if c in meta.columns]
         if meta_cols:
             df = df.merge(meta[keys + meta_cols], on=keys, how="left", suffixes=("", "_meta"))
+
+    proc_added_cols: list[str] = []
+    if not proc.empty:
+        proc_time_cols = _sorted_time_cols(proc)
+        if proc_time_cols:
+            proc_keys = _pick_merge_keys(df, proc)
+            rename_map: dict[str, str] = {}
+            for c in proc_time_cols:
+                new_c = c if str(c).startswith("P_") else f"P_{c}"
+                if new_c in df.columns:
+                    new_c = f"{new_c}_processed"
+                rename_map[c] = new_c
+                proc_added_cols.append(new_c)
+            proc_slice = proc[proc_keys + proc_time_cols].rename(columns=rename_map)
+            df = df.merge(proc_slice, on=proc_keys, how="left")
 
     # Normalize inference output columns
     if "Pred Label" not in df.columns:
@@ -277,6 +294,7 @@ def build_classifier_audit_df(
     ordered += [c for c in AUDIT_META_FEATURES if c in df.columns]
     ordered += [c for c in AUDIT_LATE_FEATURES if c in df.columns]
     ordered += [c for c in time_cols if c in df.columns]
+    ordered += [c for c in proc_added_cols if c in df.columns]
 
     ordered = _unique_cols([c for c in ordered if c in df.columns])
     return df[ordered].copy()

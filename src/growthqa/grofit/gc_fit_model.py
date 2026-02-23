@@ -42,6 +42,16 @@ def gc_fit_model(t: np.ndarray, y: np.ndarray) -> FitResult:
                 bounds=spec.bounds,
                 maxfev=20000
             )
+
+            lb, ub = spec.bounds
+            hit_bounds = bool(
+                np.any(np.isclose(popt, lb, atol=1e-5, rtol=0.0))
+                or np.any(np.isclose(popt, ub, atol=1e-5, rtol=0.0))
+            )
+            if hit_bounds:
+                # Parameter pegged at bounds indicates optimizer did not find a stable interior optimum.
+                continue
+
             y_hat = spec.func(t, *popt)
             rss = float(np.sum((y - y_hat) ** 2))
             n = int(len(t))
@@ -62,6 +72,7 @@ def gc_fit_model(t: np.ndarray, y: np.ndarray) -> FitResult:
                 fitted_func=fitted_func,
                 t_min=t_min,
                 t_max=t_max,
+                params=np.asarray(popt, float),
             )
 
             res = FitResult(

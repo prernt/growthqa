@@ -37,22 +37,36 @@ def _spline_payload(
         s_used = fit.extra.get("s")
     if s_used is None:
         s_used = spline_s if spline_s is not None else 0.0
+    try:
+        s_used = float(s_used)
+    except Exception:
+        s_used = 0.0
+    if not np.isfinite(s_used) or s_used < 0.0:
+        s_used = 0.0
 
     # Rebuild spline to get grid + curve
-    from scipy.interpolate import UnivariateSpline
+    from scipy.interpolate import make_smoothing_spline
+    from growthqa.grofit.gc_fit_spline import _dedupe_sorted_xy
 
     order = np.argsort(t)
     t_sorted = t[order]
     y_sorted = y[order]
-    k_spline = min(3, len(t_sorted) - 1)
-    sp = UnivariateSpline(t_sorted, y_sorted, k=k_spline, s=float(s_used))
-    t_grid = np.linspace(float(np.min(t_sorted)), float(np.max(t_sorted)), 400)
+    # Match the backend exactly
+    t_dedup, y_dedup = _dedupe_sorted_xy(t_sorted, y_sorted)
+
+    lam_used = float(s_used) if s_used is not None else None
+    sp = make_smoothing_spline(t_dedup, y_dedup, lam=lam_used)
+
+    t_grid = np.linspace(float(np.min(t_dedup)), float(np.max(t_dedup)), 400)
     y_grid = sp(t_grid)
     dy = sp.derivative(1)(t_grid)
-    idx = int(np.nanargmax(dy))
-    t_mu = float(t_grid[idx])
-    y_mu = float(np.interp(t_mu, t_grid, y_grid))
-    y0 = float(np.nanpercentile(y_grid, 5))
+
+    # Use the EXACT parameters from the backend fit to avoid split-brain UI bugs
+    extra = fit.extra or {}
+    t_mu = extra.get("t_star", np.nan)
+    y_mu = extra.get("y_star", np.nan)
+    y0 = extra.get("y0", np.nan)
+
     return {
         "ran": True,
         "t_grid": t_grid,
@@ -63,9 +77,9 @@ def _spline_payload(
             "lambda": float(fit.lag) if fit.lag is not None else np.nan,
             "A": float(fit.A) if fit.A is not None else np.nan,
             "integral": float(fit.integral) if fit.integral is not None else np.nan,
-            "y0": y0,
-            "t_mu": t_mu,
-            "y_mu": y_mu,
+            "y0": float(y0),
+            "t_mu": float(t_mu),
+            "y_mu": float(y_mu),
         },
     }
 
@@ -276,6 +290,12 @@ def build_dr_payload(
             yy = y[order]
             k_spline = min(3, len(xt) - 1)
             s_used = fit.get("s") if fit.get("success") else (dr_s if dr_s is not None else 0.0)
+            try:
+                s_used = float(s_used)
+            except Exception:
+                s_used = 0.0
+            if not np.isfinite(s_used) or s_used < 0.0:
+                s_used = 0.0
             sp = UnivariateSpline(xt, yy, k=k_spline, s=float(s_used))
             y_hat = sp(xt_grid)
         except Exception:

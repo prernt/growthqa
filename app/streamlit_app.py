@@ -93,7 +93,7 @@ class GrofitOptions:
     spline_auto_cv: bool = True
     spline_s: float | None = None
     dr_s: float | None = None
-    dr_x_transform: str | None = "log1p"
+    dr_x_transform: str | None = "log10"
     bootstrap_method: str = "pairs"
 
 
@@ -258,6 +258,37 @@ def make_overlay_plot(
     return fig
 
 
+def _generate_fast_bootstrap_bands(t, y, lam_s, B=100):
+    from scipy.interpolate import make_smoothing_spline
+
+    t, y = np.asarray(t, float), np.asarray(y, float)
+    order = np.argsort(t)
+    t, y = t[order], y[order]
+
+    try:
+        lam_s = float(lam_s) if lam_s is not None else None
+        sp_base = make_smoothing_spline(t, y, lam=lam_s)
+        y_fit = sp_base(t)
+        resid = y - y_fit
+        t_grid = np.linspace(np.min(t), np.max(t), 400)
+
+        y_boots = []
+        rng = np.random.default_rng()
+        for _ in range(B):
+            y_b = y_fit + rng.choice(resid, size=len(resid), replace=True)
+            try:
+                sp_b = make_smoothing_spline(t, y_b, lam=lam_s)
+                y_boots.append(sp_b(t_grid))
+            except Exception:
+                pass
+        if not y_boots:
+            return None, None
+        y_boots = np.array(y_boots)
+        return np.percentile(y_boots, 2.5, axis=0), np.percentile(y_boots, 97.5, axis=0)
+    except Exception:
+        return None, None
+
+
 def make_overlay_plot_payload(
     payload: dict,
     *,
@@ -267,6 +298,10 @@ def make_overlay_plot_payload(
     show_bootstrap: bool,
 ) -> go.Figure:
     fig = go.Figure()
+    spline_color = "#f28e2b"   # orange
+    param_color = "#2ca02c"    # green
+    tangent_color = "#8b4513"  # brown
+    bootstrap_color = "rgba(139,0,0,0.24)"  # dark red
 
     t_raw = payload.get("t_raw", np.array([]))
     y_raw = payload.get("y_raw", np.array([]))
@@ -286,7 +321,7 @@ def make_overlay_plot_payload(
                 y=spline["y_hat"],
                 mode="lines",
                 name="Spline Fit",
-                line=dict(dash="dash"),
+                line=dict(dash="dash", color=spline_color),
             )
         )
 
@@ -306,34 +341,32 @@ def make_overlay_plot_payload(
                     name="μ point",
                     text=["μ"],
                     textposition="top center",
+                    marker=dict(size=14, color=spline_color, line=dict(width=1, color="#5a3a16")),
                 )
             )
-        # Tangent at max growth using y = mu * (t - lambda), drawn over the
-        # approximate exponential phase for visual slope verification.
+        # Tangent at max growth using point-slope form anchored at (t_mu, y_mu)
         if np.isfinite(mu) and np.isfinite(lam) and abs(float(mu)) > 1e-12:
-            t_grid = np.asarray(spline.get("t_grid", []), dtype=float)
-            y_hat = np.asarray(spline.get("y_hat", []), dtype=float)
-            x_min = float(np.nanmin(t_grid)) if t_grid.size else float(np.nanmin(t_proc)) if len(t_proc) else float(lam)
-            x_max = float(np.nanmax(t_grid)) if t_grid.size else float(np.nanmax(t_proc)) if len(t_proc) else float(lam + 1.0)
-            if np.isfinite(y0) and np.isfinite(A) and t_grid.size and y_hat.size and A > 0:
-                y_lo = float(y0 + 0.1 * A)
-                y_hi = float(y0 + 0.9 * A)
-                mask = np.isfinite(t_grid) & np.isfinite(y_hat) & (y_hat >= y_lo) & (y_hat <= y_hi)
-                if np.any(mask):
-                    x_min = float(np.nanmin(t_grid[mask]))
-                    x_max = float(np.nanmax(t_grid[mask]))
-            x_min = max(x_min, float(np.nanmin(t_proc)) if len(t_proc) else x_min)
-            x_max = min(x_max, float(np.nanmax(t_proc)) if len(t_proc) else x_max)
-            if x_max > x_min:
-                x_line = np.array([x_min, x_max], dtype=float)
-                y_line = mu * (x_line - lam)
+            if np.isfinite(y0) and np.isfinite(A) and A > 0 and np.isfinite(t_mu) and np.isfinite(y_mu):
+                x_base = float(lam)
+                x_plat = float(lam + A / mu)
+
+                # Add 15% visual padding to the line length so it extends cleanly
+                x_span = x_plat - x_base
+                x_min_plot = x_base - 0.15 * x_span
+                x_max_plot = x_plat + 0.15 * x_span
+
+                x_line = np.array([x_min_plot, x_max_plot], dtype=float)
+
+                # MATHEMATICAL FIX: Anchor the equation directly to the plotted dot
+                y_line = mu * (x_line - t_mu) + y_mu
+
                 fig.add_trace(
                     go.Scatter(
                         x=x_line,
                         y=y_line,
                         mode="lines",
                         name="Tangent (mu)",
-                        line=dict(color="#8b4513", width=2),
+                        line=dict(color=tangent_color, width=2),
                     )
                 )
         if np.isfinite(lam):
@@ -365,7 +398,7 @@ def make_overlay_plot_payload(
                 y=parametric["y_hat"],
                 mode="lines",
                 name=f"Model ({parametric.get('model_name','')})",
-                line=dict(dash="dashdot"),
+                line=dict(dash="dashdot", color=param_color),
             )
         )
 
@@ -387,7 +420,7 @@ def make_overlay_plot_payload(
                 y=bootstrap.get("y_hat_q025"),
                 line=dict(width=0),
                 fill="tonexty",
-                fillcolor="rgba(194,109,58,0.15)",
+                fillcolor=bootstrap_color,
                 showlegend=True,
                 name="Bootstrap band",
                 hoverinfo="skip",
@@ -400,7 +433,7 @@ def make_overlay_plot_payload(
         yaxis_title="Relative OD",
         height=520,
         margin=dict(l=30, r=10, t=50, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, bgcolor="rgba(255, 255, 255, 0.5)"),
     )
     return fig
 
@@ -454,6 +487,7 @@ def make_dr_plot(payload: dict, *, show_bootstrap: bool) -> go.Figure:
         yaxis_title=payload.get("metric", "response"),
         height=420,
         margin=dict(l=30, r=10, t=30, b=40),
+        legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="center", x=0.5, bgcolor="rgba(255, 255, 255, 0.5)"),
     )
     return fig
 
@@ -934,14 +968,26 @@ def _build_classifier_output(
     review_df: pd.DataFrame | None,
     manual_review_mode: bool,
     meta_df: pd.DataFrame | None = None,
+    processed_wide_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    return build_classifier_audit_df(
+    kwargs = dict(
         wide_original_df=wide_df,
         infer_df=out_df,
         meta_df=meta_df if isinstance(meta_df, pd.DataFrame) else out_df,
         mode="MANUAL" if manual_review_mode else "AUTO",
         review_df=review_df,
     )
+    if processed_wide_df is not None:
+        try:
+            return build_classifier_audit_df(
+                **kwargs,
+                processed_wide_df=processed_wide_df,
+            )
+        except TypeError:
+            # Backward compatibility: older installed growthqa builds may not
+            # yet expose the processed_wide_df argument.
+            pass
+    return build_classifier_audit_df(**kwargs)
 
 
 def _build_grofit_input_df(
@@ -976,6 +1022,7 @@ def _build_export_zip(
     gc_boot: pd.DataFrame,
     dr_fit: pd.DataFrame,
     dr_boot: pd.DataFrame,
+    proc_wide_df: pd.DataFrame | None,
     grofit_opts: GrofitOptions,
     settings: InferenceSettings,
     mode_label: str,
@@ -997,6 +1044,7 @@ def _build_export_zip(
         out_df=out_df,
         review_df=review_df,
         manual_review_mode=(mode_label == "MANUAL"),
+        processed_wide_df=proc_wide_df,
     )
     grofit_input_df = grofit_df if isinstance(grofit_df, pd.DataFrame) else _build_grofit_input_df(
         wide_df=wide_df,
@@ -1043,7 +1091,113 @@ def _build_export_zip(
         if isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty:
             zf.writestr("drBoot.csv", _df_bytes(dr_boot))
         zf.writestr("run_info.json", json.dumps(run_info, indent=2))
-        zf.writestr("plots/README.txt", "Plots were not generated in this run.")
+
+        n_plot_files = 0
+
+        valid_ids: list[str] = []
+        if isinstance(classifier_df, pd.DataFrame) and not classifier_df.empty and "Test Id" in classifier_df.columns:
+            label_col = "True Label" if "True Label" in classifier_df.columns else ("Pred Label" if "Pred Label" in classifier_df.columns else None)
+            if label_col is not None:
+                labels = classifier_df[label_col].map(_normalize_label)
+                valid_ids = classifier_df.loc[labels == "Valid", "Test Id"].astype(str).drop_duplicates().tolist()
+        if valid_ids:
+            fit_source_wide = proc_wide_df if isinstance(proc_wide_df, pd.DataFrame) and not proc_wide_df.empty else wide_df
+            try:
+                curves_tidy = wide_original_to_grofit_tidy(fit_source_wide, file_tag=file_stem)
+            except Exception:
+                curves_tidy = pd.DataFrame()
+
+            labels_for_payload = pd.DataFrame({"Test Id": valid_ids})
+            if isinstance(classifier_df, pd.DataFrame) and not classifier_df.empty and "Test Id" in classifier_df.columns:
+                label_map = classifier_df.drop_duplicates(subset=["Test Id"]).set_index("Test Id")
+                if "Pred Label" in label_map.columns:
+                    labels_for_payload["pred_label"] = labels_for_payload["Test Id"].map(label_map["Pred Label"]).map(_normalize_label)
+                else:
+                    labels_for_payload["pred_label"] = "Valid"
+                if "True Label" in label_map.columns:
+                    labels_for_payload["final_label"] = labels_for_payload["Test Id"].map(label_map["True Label"]).map(_normalize_label)
+                else:
+                    labels_for_payload["final_label"] = labels_for_payload["pred_label"]
+                labels_for_payload["Reviewed"] = False
+            else:
+                labels_for_payload["pred_label"] = "Valid"
+                labels_for_payload["final_label"] = "Valid"
+                labels_for_payload["Reviewed"] = False
+
+            if isinstance(curves_tidy, pd.DataFrame) and not curves_tidy.empty:
+                payloads = build_curve_payloads(
+                    curves_df=curves_tidy,
+                    raw_wide=wide_df,
+                    proc_wide=fit_source_wide,
+                    labels_df=labels_for_payload,
+                    gc_boot=gc_boot if isinstance(gc_boot, pd.DataFrame) else None,
+                    spline_s=grofit_opts.spline_s,
+                    spline_auto_cv=grofit_opts.spline_auto_cv,
+                    include_bootstrap=bool(isinstance(gc_boot, pd.DataFrame) and not gc_boot.empty),
+                    test_id=file_stem,
+                    curve_ids=valid_ids,
+                )
+
+                for tid in valid_ids:
+                    payload = payloads.get(str(tid))
+                    if not payload:
+                        continue
+                    plot_payload = dict(payload)
+                    # Export requirement: fit-only view (no raw/processed traces).
+                    plot_payload["t_raw"] = np.array([], dtype=float)
+                    plot_payload["y_raw"] = np.array([], dtype=float)
+                    plot_payload["t_proc"] = np.array([], dtype=float)
+                    plot_payload["y_proc"] = np.array([], dtype=float)
+
+                    fig = make_overlay_plot_payload(
+                        plot_payload,
+                        title=str(tid),
+                        show_spline=True,
+                        show_model=True,
+                        show_bootstrap=bool(plot_payload.get("bootstrap", {}).get("ran", False)),
+                    )
+                    safe_tid = re.sub(r"[^A-Za-z0-9._-]+", "_", str(tid)).strip("_") or "curve"
+                    zf.writestr(f"plots/{safe_tid}.html", fig.to_html(full_html=True, include_plotlyjs="cdn"))
+                    n_plot_files += 1
+
+        if isinstance(dr_fit, pd.DataFrame) and not dr_fit.empty and isinstance(gc_fit, pd.DataFrame) and not gc_fit.empty:
+            labels_for_dr = pd.DataFrame()
+            if isinstance(classifier_df, pd.DataFrame) and not classifier_df.empty and "Test Id" in classifier_df.columns:
+                labels_for_dr["Test Id"] = classifier_df["Test Id"].astype(str)
+                if "True Label" in classifier_df.columns:
+                    labels_for_dr["final_label"] = classifier_df["True Label"].map(_normalize_label)
+                elif "Pred Label" in classifier_df.columns:
+                    labels_for_dr["final_label"] = classifier_df["Pred Label"].map(_normalize_label)
+                else:
+                    labels_for_dr["final_label"] = ""
+                labels_for_dr["pred_label"] = labels_for_dr["final_label"]
+                labels_for_dr["Reviewed"] = False
+
+            dr_test_id = None
+            if "name" in dr_fit.columns:
+                dr_names = dr_fit["name"].dropna().astype(str).tolist()
+                dr_test_id = dr_names[0] if dr_names else None
+
+            if not labels_for_dr.empty:
+                dr_payload = build_dr_payload(
+                    gc_fit=gc_fit,
+                    labels_df=labels_for_dr,
+                    dr_boot=dr_boot if isinstance(dr_boot, pd.DataFrame) else None,
+                    test_id=dr_test_id,
+                    response_metric=str(grofit_opts.response_var),
+                    label_source="final",
+                    include_unsure=False,
+                    include_invalid=False,
+                    dr_s=grofit_opts.dr_s,
+                    dr_x_transform=grofit_opts.dr_x_transform,
+                    show_bootstrap=bool(isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty),
+                )
+                dr_fig = make_dr_plot(dr_payload, show_bootstrap=bool(isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty))
+                zf.writestr("plots/Dose_Response.html", dr_fig.to_html(full_html=True, include_plotlyjs="cdn"))
+                n_plot_files += 1
+
+        if n_plot_files == 0:
+            zf.writestr("plots/README.txt", "No plot assets could be generated for this run.")
 
     return zip_name, bio.getvalue()
 
@@ -1121,6 +1275,7 @@ def render_results(results: dict):
             review_df=review_df if manual_review_mode else None,
             manual_review_mode=manual_review_mode,
             meta_df=meta_df if isinstance(meta_df, pd.DataFrame) else out_df,
+            processed_wide_df=final_merged if isinstance(final_merged, pd.DataFrame) else None,
         )
     grofit_df = results.get("grofit_df")
     if not isinstance(grofit_df, pd.DataFrame) or grofit_df.empty:
@@ -1156,7 +1311,17 @@ def render_results(results: dict):
         curve_df = review_df.copy()
         merge_cols = [
             c
-            for c in ["pred_label", "pred_confidence", "confidence_valid", "confidence_invalid", "too_sparse", "low_resolution", "had_outliers"]
+            for c in [
+                "pred_label",
+                "Pred Label",
+                "pred_confidence",
+                "Pred Confidence",
+                "confidence_valid",
+                "confidence_invalid",
+                "too_sparse",
+                "low_resolution",
+                "had_outliers",
+            ]
             if c in out_df.columns
         ]
         if merge_cols:
@@ -1166,7 +1331,18 @@ def render_results(results: dict):
         if "Concentration" not in curve_df.columns:
             curve_df["Concentration"] = curve_df["Test Id"].map(conc_map)
 
-    pred_col = "pred_label"
+    pred_col = next(
+        (
+            c
+            for c in ["pred_label", "Pred Label", "final_label", "true_label", "Predicted S1 Label"]
+            if c in curve_df.columns
+        ),
+        None,
+    )
+    if pred_col is None:
+        pred_col = "_pred_label_fallback"
+        curve_df[pred_col] = ""
+    curve_df["_filter_label"] = curve_df[pred_col].map(_normalize_label)
 
     st.markdown("---")
     st.markdown(f"### {'MANUAL MODE' if manual_review_mode else 'AUTO MODE'}")
@@ -1653,7 +1829,7 @@ def render_results(results: dict):
 
         # Build filtered options list (same logic as before)
         if filter_choice != "All":
-            filtered = curve_df[curve_df[pred_col] == filter_choice].copy()
+            filtered = curve_df[curve_df["_filter_label"] == filter_choice].copy()
         else:
             filtered = curve_df.copy()
 
@@ -1816,6 +1992,57 @@ def render_results(results: dict):
         r_spacer.markdown("")
         return sel
 
+    @st.dialog("Configure & Run Grofit")
+    def _configure_and_run_grofit_dialog():
+        st.write("Review your pipeline settings before executing Grofit.")
+        c1, c2 = st.columns(2)
+        with c1:
+            gc_bootstrap_targets = st.selectbox(
+                "GC Bootstrap Targets",
+                options=["None", "Only Valid Curves", "Custom List"],
+                index=["None", "Only Valid Curves", "Custom List"].index(
+                    st.session_state.get("exit_gc_bootstrap", "None")
+                    if st.session_state.get("exit_gc_bootstrap", "None") in {"None", "Only Valid Curves", "Custom List"}
+                    else "None"
+                ),
+            )
+            response_metric = st.selectbox(
+                "Response Metric",
+                options=["mu", "A", "lag", "integral"],
+                index=["mu", "A", "lag", "integral"].index(
+                    st.session_state.get("exit_response_metric", "mu")
+                    if st.session_state.get("exit_response_metric", "mu") in {"mu", "A", "lag", "integral"}
+                    else "mu"
+                ),
+            )
+        with c2:
+            preferred_model = st.selectbox(
+                "Preferred Model",
+                options=["Best Model", "Spline", "Parametric"],
+                index=["Best Model", "Spline", "Parametric"].index(
+                    st.session_state.get("exit_preferred_model", "Best Model")
+                    if st.session_state.get("exit_preferred_model", "Best Model") in {"Best Model", "Spline", "Parametric"}
+                    else "Best Model"
+                ),
+            )
+            dr_bootstrap = st.selectbox(
+                "DR Bootstrap",
+                options=["True", "False"],
+                index=["True", "False"].index(
+                    st.session_state.get("exit_dr_bootstrap", "True")
+                    if st.session_state.get("exit_dr_bootstrap", "True") in {"True", "False"}
+                    else "True"
+                ),
+            )
+        st.divider()
+        if st.button("Confirm & Run Pipeline", type="primary", use_container_width=True):
+            st.session_state["exit_gc_bootstrap"] = gc_bootstrap_targets
+            st.session_state["exit_response_metric"] = response_metric
+            st.session_state["exit_preferred_model"] = preferred_model
+            st.session_state["exit_dr_bootstrap"] = dr_bootstrap
+            st.session_state["trigger_grofit_run"] = True
+            st.rerun()
+
     curve_payload = None
     if (
         isinstance(grofit_tidy_all, pd.DataFrame)
@@ -1839,80 +2066,59 @@ def render_results(results: dict):
         curve_payload = payloads.get(str(chosen))
 
 
-    # ============================
-    # ROW 2: Curve overlay (left) + Metrics table content (right)
-    # ============================
-    left, right = st.columns([2.2, 1.0], gap="large")
+    tab_curve, tab_dr = st.tabs(["Single Curve Review", "Dose Response Analysis"])
 
-    # Precompute DR payload for split view
-    dr_available = isinstance(dr_fit, pd.DataFrame) and not dr_fit.empty
-    dr_payload = None
-    if dr_available:
-        label_source = "final" if manual_review_mode else "pred"
-        dr_payload = build_dr_payload(
-            gc_fit=gc_fit,
-            labels_df=labels_df,
-            dr_boot=dr_boot,
-            test_id=active_test_id,
-            response_metric=grofit_opts.response_var if grofit_opts.response_var in {"mu", "A", "lambda", "integral"} else "mu",
-            label_source=label_source,
-            include_unsure=False,
-            include_invalid=False,
-            dr_s=grofit_opts.dr_s,
-            dr_x_transform=grofit_opts.dr_x_transform,
-            show_bootstrap=bool(isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty),
-        )
-        if not dr_payload or not dr_payload.get("n_points"):
-            dr_available = False
+    with tab_curve:
+        left, right = st.columns([2.2, 1.0], gap="large")
 
-    with left:
-        st.markdown('<div class="curve-title">Curve Viewer</div>', unsafe_allow_html=True)
-        show_c1, show_c2, show_c3 = st.columns(3)
-        show_spline = show_c1.checkbox("Show spline", value=True, key="show_spline_overlay")
-        show_model = show_c2.checkbox("Show model", value=True, key="show_model_overlay")
-        boot_available = bool(isinstance(gc_boot, pd.DataFrame) and not gc_boot.empty)
-        show_bootstrap = show_c3.checkbox(
-            "Show bootstrap",
-            value=False,
-            key="show_boot_overlay",
-            disabled=not boot_available,
-        )
+        with left:
+            st.markdown('<div class="curve-title">Curve Viewer</div>', unsafe_allow_html=True)
+            # 1. Determine if Bootstrap bands are available (from bulk export or on-demand session state)
+            bulk_boot_available = bool(isinstance(gc_boot, pd.DataFrame) and not gc_boot.empty)
+            session_boot_key = f"boot_arrays_{chosen}"
+            boot_arrays_ready = bulk_boot_available or (session_boot_key in st.session_state)
 
-        if wide_original is not None and not final_merged.empty:
-            raw_row = wide_original.loc[wide_original["Test Id"].astype(str) == str(chosen)]
-            proc_row = final_merged.loc[final_merged["Test Id"].astype(str) == str(chosen)]
-            if not raw_row.empty and not proc_row.empty:
-                if dr_available and dr_payload:
-                    ov_col, dr_col = st.columns(2)
-                    with ov_col:
-                        if curve_payload:
-                            fig = make_overlay_plot_payload(
-                                curve_payload,
-                                title=f"{chosen}",
-                                show_spline=show_spline,
-                                show_model=show_model,
-                                show_bootstrap=show_bootstrap,
-                            )
-                        else:
-                            fig = make_overlay_plot(
-                                raw_row.iloc[0],
-                                time_cols_original,
-                                proc_row.iloc[0],
-                                time_cols_final,
-                                title=f"{chosen}",
-                                input_is_raw=settings.input_is_raw,
-                                global_blank=settings.global_blank,
-                            )
-                        fig.update_layout(height=580)
-                        st.plotly_chart(fig, use_container_width=True)
-                    with dr_col:
-                        dr_fig = make_dr_plot(
-                            dr_payload,
-                            show_bootstrap=bool(isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty),
-                        )
-                        dr_fig.update_layout(height=580)
-                        st.plotly_chart(dr_fig, use_container_width=True)
-                else:
+            # 2. Render Overlay Pills
+            overlay_options = ["Spline Fit", "Parametric Model"]
+            if manual_review_mode:
+                overlay_options.append("Bootstrap CI")
+
+            overlay_selected = st.pills(
+                " ",
+                options=overlay_options,
+                default=["Spline Fit", "Parametric Model"],
+                selection_mode="multi",
+                key="curve_overlay_pills",
+            )
+
+            # 3. Inject Session State Bootstrap into Payload if needed
+            if not bulk_boot_available and (session_boot_key in st.session_state) and curve_payload:
+                y_lo, y_hi = st.session_state[session_boot_key]
+                curve_payload.setdefault("bootstrap", {})
+                curve_payload["bootstrap"]["ran"] = True
+                curve_payload["bootstrap"]["y_hat_q025"] = y_lo
+                curve_payload["bootstrap"]["y_hat_q975"] = y_hi
+
+            # 4. On-demand Bootstrap generation: in MANUAL mode, selecting Bootstrap CI triggers computation.
+            wants_bootstrap = manual_review_mode and ("Bootstrap CI" in overlay_selected)
+            if wants_bootstrap and (not boot_arrays_ready) and curve_payload:
+                with st.spinner("Running fast in-memory bootstrap for UI..."):
+                    lam_s = curve_payload["spline"].get("extra", {}).get("lam")
+                    y_lo, y_hi = _generate_fast_bootstrap_bands(
+                        curve_payload["t_proc"], curve_payload["y_proc"], lam_s=lam_s
+                    )
+                    if y_lo is not None:
+                        st.session_state[session_boot_key] = (y_lo, y_hi)
+                    st.rerun()
+
+            show_spline = "Spline Fit" in overlay_selected
+            show_model = "Parametric Model" in overlay_selected
+            show_bootstrap = manual_review_mode and ("Bootstrap CI" in overlay_selected) and boot_arrays_ready
+
+            if wide_original is not None and not final_merged.empty:
+                raw_row = wide_original.loc[wide_original["Test Id"].astype(str) == str(chosen)]
+                proc_row = final_merged.loc[final_merged["Test Id"].astype(str) == str(chosen)]
+                if not raw_row.empty and not proc_row.empty:
                     if curve_payload:
                         fig = make_overlay_plot_payload(
                             curve_payload,
@@ -1931,413 +2137,222 @@ def render_results(results: dict):
                             input_is_raw=settings.input_is_raw,
                             global_blank=settings.global_blank,
                         )
-                    fig.update_layout(height=520)
+                    fig.update_layout(height=600)
                     st.plotly_chart(fig, use_container_width=True)
 
-                nav_left, nav_right = st.columns(2)
-                if nav_left.button("Previous Curve", key="prev_curve_overlay", use_container_width=True):
-                    idx = options.index(str(chosen))
-                    _nav_set((idx - 1) % len(options))
-                if nav_right.button("Next Curve", key="next_curve_overlay", use_container_width=True):
-                    idx = options.index(str(chosen))
-                    _nav_set((idx + 1) % len(options))
+                    nav_left, nav_right = st.columns(2)
+                    if nav_left.button("Previous Curve", key="prev_curve_overlay", use_container_width=True):
+                        idx = options.index(str(chosen))
+                        _nav_set((idx - 1) % len(options))
+                    if nav_right.button("Next Curve", key="next_curve_overlay", use_container_width=True):
+                        idx = options.index(str(chosen))
+                        _nav_set((idx + 1) % len(options))
 
-                if manual_review_mode:
-                    action_left, action_right = st.columns(2)
-                    boot_list = st.session_state.get("bootstrap_curve_ids", [])
-                    is_added = str(chosen) in boot_list
-                    st.markdown(
-                        '<div class="boot-btn added">' if is_added else '<div class="boot-btn">',
-                        unsafe_allow_html=True,
+                else:
+                    st.warning("Could not find curve data for overlay plot.")
+            else:
+                st.warning("No time columns found for plotting.")
+
+        with right:
+            st.markdown('<div class="metrics-panel">', unsafe_allow_html=True)
+
+            def _fmt_ci_metric(val: object, ci: list | None) -> str:
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    return "NA"
+                if isinstance(val, (int, float, np.floating)):
+                    base = f"{float(val):.4f}"
+                else:
+                    base = str(val)
+                if ci and len(ci) == 2:
+                    lo = pd.to_numeric(pd.Series([ci[0]]), errors="coerce").iloc[0]
+                    hi = pd.to_numeric(pd.Series([ci[1]]), errors="coerce").iloc[0]
+                    if np.isfinite(lo) and np.isfinite(hi):
+                        return f"{base} ({float(lo):.4f}-{float(hi):.4f})"
+                return base
+
+            with st.container(border=True):
+                label_color = {"valid": "#2e7d32", "invalid": "#c62828", "unsure": "#ef6c00"}.get(pred_label.strip().lower(), "#5f4337")
+                st.markdown(
+                    (
+                        "<div style='border:1px solid #8f8f8f;border-radius:8px;padding:8px 10px;margin:4px 0 10px 0;'>"
+                        "<div style='font-size:1.0rem;font-weight:500;'>Predicted Label</div>"
+                        f"<div style='font-size:1.2rem;font-weight:700;color:{label_color};'>{_fmt_val(pred_label)}</div>"
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+                if manual_review_mode and isinstance(review_df, pd.DataFrame) and not review_df.empty:
+                    curve_key = row.get("CurveKey")
+                    if not curve_key:
+                        curve_key = _make_curve_key(str(row["Test Id"]), row.get("Concentration"))
+                    label_key = f"true_label_{curve_key}"
+                    reviewed_key = f"reviewed_{curve_key}"
+
+                    if label_key not in st.session_state:
+                        true_norm = _normalize_label(row.get("true_label", row.get("final_label", pred_label)))
+                        st.session_state[label_key] = true_norm if true_norm in {"Valid", "Invalid", "Unsure"} else "Unsure"
+
+                    if reviewed_key not in st.session_state:
+                        st.session_state[reviewed_key] = "True" if bool(row.get("Reviewed", False)) else "False"
+                    elif isinstance(st.session_state[reviewed_key], bool):
+                        st.session_state[reviewed_key] = "True" if st.session_state[reviewed_key] else "False"
+
+                    new_final = _render_select_row(
+                        "True Label",
+                        ["Valid", "Invalid", "Unsure"],
+                        ["Valid", "Invalid", "Unsure"].index(st.session_state[label_key]),
+                        label_key,
                     )
-                    if action_left.button(
-                        "Remove This Curve From Bootstrap" if is_added else "Add This Curve To Bootstrap",
-                        key="add_boot_curve",
-                        use_container_width=True,
-                    ):
-                        if is_added:
-                            boot_list = [c for c in boot_list if c != str(chosen)]
-                        else:
-                            boot_list.append(str(chosen))
-                        st.session_state["bootstrap_curve_ids"] = boot_list
-                        st.rerun()
-                    st.markdown("</div>", unsafe_allow_html=True)
-                    run_exit_grofit = False
-                    if st.session_state.get("show_exit_review"):
-                        if action_right.button("RUN GROFIT", key="exit_review_mode", use_container_width=True):
-                            run_exit_grofit = True
-                    else:
-                        if action_right.button("Exit Review Mode", key="exit_review_mode", use_container_width=True):
-                            st.session_state["show_exit_review"] = True
-                            st.rerun()
-                    if st.session_state.get("show_exit_review"):
-                        boot_list = st.session_state.get("bootstrap_curve_ids", [])
-                        boot_label = f"Selected Curves ({len(boot_list)})"
-                        boot_options = ["None", "Only Valid Curves"]
-                        if boot_list:
-                            boot_options.append(boot_label)
-                        exit_c1, exit_c2 = st.columns(2)
-                        exit_c3, exit_c4 = st.columns(2)
-                        gc_bootstrap = exit_c1.selectbox(
-                            "GC Bootstrap",
-                            options=boot_options,
-                            index=0,
-                            key="exit_gc_bootstrap",
+                    reviewed_val = _render_select_row(
+                        "Reviewed",
+                        ["False", "True"],
+                        1 if st.session_state[reviewed_key] == "True" else 0,
+                        reviewed_key,
+                    )
+                    reviewed_bool = reviewed_val == "True"
+                    label_reason_raw = out_row.get("Label Reason", row.get("Label Reason", ""))
+                    label_reason_txt = ""
+                    if label_reason_raw is not None and not (isinstance(label_reason_raw, float) and pd.isna(label_reason_raw)):
+                        label_reason_txt = str(label_reason_raw).strip()
+                    if label_reason_txt:
+                        _render_row("Label Reason", label_reason_txt)
+
+                    if new_final != _normalize_label(row.get("true_label", row.get("final_label", pred_label))) or reviewed_bool != bool(row.get("Reviewed", False)):
+                        review_df.loc[review_df["CurveKey"] == curve_key, "true_label"] = new_final
+                        review_df.loc[review_df["CurveKey"] == curve_key, "is_valid_true"] = (new_final == "Valid")
+                        review_df.loc[review_df["CurveKey"] == curve_key, "is_valid_final"] = review_df.loc[review_df["CurveKey"] == curve_key, "is_valid_true"]
+                        review_df.loc[review_df["CurveKey"] == curve_key, "Reviewed"] = reviewed_bool
+                        st.session_state["review_df"] = review_df
+                        updated_audit = _build_classifier_output(
+                            wide_df=wide_for_artifacts,
+                            out_df=out_df,
+                            review_df=review_df,
+                            manual_review_mode=True,
+                            meta_df=meta_df if isinstance(meta_df, pd.DataFrame) else out_df,
+                            processed_wide_df=final_merged if isinstance(final_merged, pd.DataFrame) else None,
                         )
-                        preferred_model = exit_c2.selectbox(
-                            "Preferred Model",
-                            options=["Best Model", "Spline", "Parametric"],
-                            index=0,
-                            key="exit_preferred_model",
+                        updated_grofit = _build_grofit_input_df(
+                            wide_df=wide_for_artifacts,
+                            out_df=out_df,
+                            review_df=review_df,
+                            manual_review_mode=True,
+                            meta_df=meta_df if isinstance(meta_df, pd.DataFrame) else out_df,
+                            audit_df=updated_audit,
                         )
-                        response_metric = exit_c3.selectbox(
-                            "Response Metric",
-                            options=["mu", "A", "lag", "integral"],
-                            index=0,
-                            key="exit_response_metric",
-                        )
-                        dr_bootstrap = exit_c4.selectbox(
-                            "DR Bootstrap",
-                            options=["True", "False"],
-                            index=0,
-                            key="exit_dr_bootstrap",
-                        )
-                        cancel_left, cancel_right = st.columns([1.2, 1.0])
-                        if cancel_right.button("Cancel", key="exit_review_cancel", use_container_width=True):
-                            st.session_state["show_exit_review"] = False
-                            st.rerun()
-                    if run_exit_grofit:
-                        gc_bootstrap = st.session_state.get("exit_gc_bootstrap", "None")
-                        preferred_model = st.session_state.get("exit_preferred_model", "Best Model")
-                        response_metric = st.session_state.get("exit_response_metric", "mu")
-                        dr_bootstrap = st.session_state.get("exit_dr_bootstrap", "True")
-                        with st.spinner("Preparing Grofit raw file (raw OD + final labels) and running Grofit..."):
-                            grofit_source_df = results.get("grofit_df")
-                            if not isinstance(grofit_source_df, pd.DataFrame) or grofit_source_df.empty:
-                                grofit_source_df = _build_grofit_input_df(
-                                    wide_df=wide_original,
-                                    out_df=out_df,
-                                    review_df=review_df,
-                                    manual_review_mode=True,
-                                    meta_df=results.get("meta_df", out_df),
-                                    audit_df=results.get("audit_df"),
-                                )
-                            grofit_tidy_all = wide_original_to_grofit_tidy(grofit_source_df, file_tag=file_stem)
-                            true_map = grofit_source_df.set_index("Test Id")["True Label"].to_dict() if "True Label" in grofit_source_df.columns else {}
-                            grofit_tidy_all["true_label"] = grofit_tidy_all["curve_id"].map(true_map).apply(_normalize_label)
-                            grofit_tidy_all["is_valid_true"] = grofit_tidy_all["true_label"].map(_label_is_valid).fillna(False).astype(bool)
-
-                            preferred_fit_map = {
-                                "Best Model": "Both (param + spline)",
-                                "Spline": "Spline only",
-                                "Parametric": "Parametric only",
-                            }
-                            fit_opt_map = {
-                                "Both (param + spline)": "b",
-                                "Parametric only": "m",
-                                "Spline only": "s",
-                            }
-                            fit_mode_label = preferred_fit_map.get(preferred_model, "Both (param + spline)")
-                            fit_opt = fit_opt_map.get(fit_mode_label, "b")
-
-                            gc_boot_B = 0 if gc_bootstrap == "None" else grofit_opts.gc_boot_B
-                            dr_boot_B = grofit_opts.dr_boot_B if dr_bootstrap == "True" else 0
-                            validity_col = "__all__"
-
-                            gc_fit = pd.DataFrame()
-                            dr_fit = pd.DataFrame()
-                            gc_boot = pd.DataFrame()
-                            dr_boot = pd.DataFrame()
-                            zip_bytes = b""
-                            zip_name = ""
-
-                            grofit_tidy_all_all = grofit_tidy_all.copy()
-                            grofit_tidy_all_all["is_valid_true"] = True
-                            if not grofit_tidy_all.empty:
-                                with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as grofit_td:
-                                    grofit_res = run_grofit_pipeline(
-                                        curves_df=grofit_tidy_all_all if (boot_list and gc_bootstrap == boot_label) else grofit_tidy_all,
-                                        response_var=response_metric,
-                                        have_atleast=grofit_opts.have_atleast,
-                                        gc_boot_B=gc_boot_B,
-                                        dr_boot_B=dr_boot_B,
-                                        spline_auto_cv=grofit_opts.spline_auto_cv,
-                                        spline_s=grofit_opts.spline_s,
-                                        dr_x_transform=grofit_opts.dr_x_transform,
-                                        dr_s=grofit_opts.dr_s,
-                                        fit_opt=fit_opt,
-                                        bootstrap_method=grofit_opts.bootstrap_method,
-                                        validity_col=validity_col,
-                                        random_state=42,
-                                        export_dir=Path(grofit_td),
-                                    )
-                                    gc_fit = grofit_res.get("gc_fit", pd.DataFrame())
-                                    dr_fit = grofit_res.get("dr_fit", pd.DataFrame())
-                                    gc_boot = grofit_res.get("gc_boot", pd.DataFrame())
-                                    dr_boot = grofit_res.get("dr_boot", pd.DataFrame())
-                                    zip_name, zip_bytes = _build_export_zip(
-                                        wide_df=wide_original,
-                                        out_df=out_df,
-                                        review_df=review_df,
-                                        gc_fit=gc_fit,
-                                        gc_boot=gc_boot,
-                                        dr_fit=dr_fit,
-                                        dr_boot=dr_boot,
-                                        grofit_opts=grofit_opts,
-                                        settings=settings,
-                                        mode_label="MANUAL",
-                                        file_stem=file_stem,
-                                        predicting_model=predicting_model,
-                                        audit_df=results.get("audit_df"),
-                                        grofit_df=results.get("grofit_df"),
-                                        stage2_config=results.get("stage2_config"),
-                                    )
-
-                            if boot_list and gc_bootstrap == boot_label and not gc_boot.empty:
-                                gc_boot = gc_boot[gc_boot["add.id"].astype(str).isin(boot_list)].copy()
-
-                        results["grofit_tidy_all"] = grofit_tidy_all
-                        results["gc_fit"] = gc_fit
-                        results["dr_fit"] = dr_fit
-                        results["gc_boot"] = gc_boot
-                        results["dr_boot"] = dr_boot
-                        results["zip_bytes"] = zip_bytes
-                        results["zip_name"] = zip_name if "zip_name" in locals() else ""
-                        results["grofit_ran"] = True
+                        results["audit_df"] = updated_audit
+                        results["grofit_df"] = updated_grofit
+                        results["review_df"] = review_df
                         st.session_state["last_run_results"] = results
-                        st.session_state["show_exit_review"] = False
                         st.rerun()
-            else:
-                st.warning("Could not find curve data for overlay plot.")
+
+                    st.divider()
+                    boot_ids = st.session_state.get("bootstrap_curve_ids", [])
+                    include_bootstrap = str(chosen) in boot_ids
+                    include_bootstrap_new = st.toggle(
+                        "Include in Custom Bootstrap",
+                        value=include_bootstrap,
+                        key=f"toggle_bootstrap_{chosen}",
+                    )
+                    if include_bootstrap_new != include_bootstrap:
+                        if include_bootstrap_new:
+                            boot_ids = list(dict.fromkeys([*boot_ids, str(chosen)]))
+                        else:
+                            boot_ids = [cid for cid in boot_ids if cid != str(chosen)]
+                        st.session_state["bootstrap_curve_ids"] = boot_ids
+                        st.rerun()
+
+                pred_conf_text = "" if pred_label.strip().lower() == "unsure" else _fmt_metric(pred_conf_display)
+                _render_row(f"Confidence ({pred_label})", pred_conf_text)
+
+            if curve_payload:
+                spline_params = curve_payload.get("spline", {}).get("params", {})
+                parametric = curve_payload.get("parametric", {})
+                param_params = parametric.get("params", {})
+                boot_ci = curve_payload.get("bootstrap", {}).get("ci", {})
+                has_boot_vals = boot_row is not None and any(
+                    pd.notna(boot_row.get(k, np.nan)) for k in ["mu.bt", "lambda.bt", "A.bt", "integral.bt"]
+                )
+                metric_rows = [
+                    {"Metric": "mu", "Spline": _fmt_ci_metric(spline_params.get("mu"), boot_ci.get("mu")), "Model": _fmt_metric(param_params.get("mu"))},
+                    {"Metric": "lambda", "Spline": _fmt_ci_metric(spline_params.get("lambda"), boot_ci.get("lambda")), "Model": _fmt_metric(param_params.get("lambda"))},
+                    {"Metric": "A", "Spline": _fmt_ci_metric(spline_params.get("A"), boot_ci.get("A")), "Model": _fmt_metric(param_params.get("A"))},
+                    {"Metric": "Integral", "Spline": _fmt_ci_metric(spline_params.get("integral"), boot_ci.get("integral")), "Model": _fmt_metric(param_params.get("integral"))},
+                ]
+                if has_boot_vals:
+                    metric_rows[0]["Bootstrap"] = _fmt_metric(boot_row.get("mu.bt"))
+                    metric_rows[1]["Bootstrap"] = _fmt_metric(boot_row.get("lambda.bt"))
+                    metric_rows[2]["Bootstrap"] = _fmt_metric(boot_row.get("A.bt"))
+                    metric_rows[3]["Bootstrap"] = _fmt_metric(boot_row.get("integral.bt"))
+                params_df = pd.DataFrame(metric_rows).rename(columns={"Model": str(parametric.get("model_name") or "Model")})
+                st.dataframe(params_df, hide_index=True, use_container_width=True)
+            if manual_review_mode and st.button("Run Final Pipeline & Export", type="primary", use_container_width=True, key="run_pipeline_dialog_btn"):
+                _configure_and_run_grofit_dialog()
+
+            _render_row("Too Sparse", _fmt_val(bool(out_row.get("too_sparse")) if "too_sparse" in out_row else "NA"))
+            _render_row("Low Resolution", _fmt_val(bool(out_row.get("low_resolution")) if "low_resolution" in out_row else "NA"))
+            _render_row(
+                "Blank subtraction mode",
+                _fmt_val("RAW (applied)" if settings.input_is_raw else "ALREADY BLANK SUBTRACTED (so not applied)"),
+            )
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            with st.expander("About the Processed plot ...", expanded=False):
+                st.markdown(
+                    "- Timepoints are extracted from column headers like `T1.0 (h)` and sorted numerically.\n"
+                    "- Values come from the preprocessed table after interpolation, smoothing, and blank handling.\n"
+                    "- Y-axis is Relative OD.\n"
+                    "- Plot shows Raw vs Processed curves."
+                )
+            st.markdown("---")
+            st.markdown("#### Debug Downloads")
+            zip_name = results.get("zip_name") or f"outputs_{file_stem}.zip"
+            st.download_button(
+                "Download zip file",
+                data=zip_bytes,
+                file_name=zip_name,
+                mime="application/zip",
+                disabled=not zip_ready,
+                use_container_width=True,
+                help="Enabled only after the pipeline (Grofit) completes.",
+            )
+            st.download_button(
+                "Download Classifier Auditing.csv",
+                data=audit_df.to_csv(index=False).encode("utf-8"),
+                file_name="Classifier Auditing.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    with tab_dr:
+        dr_available = isinstance(dr_fit, pd.DataFrame) and not dr_fit.empty
+        if not dr_available:
+            st.info("Dose-response results are not available yet. Run the pipeline first.")
         else:
-            st.warning("No time columns found for plotting.")
+            left_dr, right_dr = st.columns([2.2, 1.0], gap="large")
 
-    with right:
-        # IMPORTANT: metrics content height matches plot height due to CSS height:520px
-        st.markdown('<div class="metrics-panel">', unsafe_allow_html=True)
-
-        # (Keep your existing _fmt_val, _fmt_metric, _render_row, _render_select_row exactly the same)
-        def _fmt_ci_metric(val: object, ci: list | None) -> str:
-            if val is None or (isinstance(val, float) and pd.isna(val)):
-                return "NA"
-            if isinstance(val, (int, float, np.floating)):
-                base = f"{float(val):.4f}"
-            else:
-                base = str(val)
-            if ci and len(ci) == 2:
-                lo = pd.to_numeric(pd.Series([ci[0]]), errors="coerce").iloc[0]
-                hi = pd.to_numeric(pd.Series([ci[1]]), errors="coerce").iloc[0]
-                if np.isfinite(lo) and np.isfinite(hi):
-                    return f"{base} ({float(lo):.4f}-{float(hi):.4f})"
-            return base
-
-        if curve_payload:
-            spline_params = curve_payload.get("spline", {}).get("params", {})
-            parametric = curve_payload.get("parametric", {})
-            param_params = parametric.get("params", {})
-            boot_ci = curve_payload.get("bootstrap", {}).get("ci", {})
-            has_boot_vals = boot_row is not None and any(
-                pd.notna(boot_row.get(k, np.nan)) for k in ["mu.bt", "lambda.bt", "A.bt", "integral.bt"]
-            )
-            model_name = str(parametric.get("model_name") or "Model")
-
-            rows_html = [
-                (
-                    "&mu;",
-                    _fmt_ci_metric(spline_params.get("mu"), boot_ci.get("mu")),
-                    _fmt_metric(param_params.get("mu")),
-                    _fmt_metric(boot_row.get("mu.bt")) if has_boot_vals else None,
-                ),
-                (
-                    "&lambda;",
-                    _fmt_ci_metric(spline_params.get("lambda"), boot_ci.get("lambda")),
-                    _fmt_metric(param_params.get("lambda")),
-                    _fmt_metric(boot_row.get("lambda.bt")) if has_boot_vals else None,
-                ),
-                (
-                    "A",
-                    _fmt_ci_metric(spline_params.get("A"), boot_ci.get("A")),
-                    _fmt_metric(param_params.get("A")),
-                    _fmt_metric(boot_row.get("A.bt")) if has_boot_vals else None,
-                ),
-                (
-                    "Integral",
-                    _fmt_ci_metric(spline_params.get("integral"), boot_ci.get("integral")),
-                    _fmt_metric(param_params.get("integral")),
-                    _fmt_metric(boot_row.get("integral.bt")) if has_boot_vals else None,
-                ),
-            ]
-
-            header_boot = "<th style='border:1px solid #8f8f8f;padding:4px 6px;text-align:left;'>Bootstrap</th>" if has_boot_vals else ""
-            body = []
-            for metric, spline_v, model_v, boot_v in rows_html:
-                boot_cell = f"<td style='border:1px solid #8f8f8f;padding:3px 6px;'>{boot_v}</td>" if has_boot_vals else ""
-                body.append(
-                    "<tr>"
-                    f"<td style='border:1px solid #8f8f8f;padding:3px 6px;'>{metric}</td>"
-                    f"<td style='border:1px solid #8f8f8f;padding:3px 6px;'>{spline_v}</td>"
-                    f"<td style='border:1px solid #8f8f8f;padding:3px 6px;'>{model_v}</td>"
-                    f"{boot_cell}"
-                    "</tr>"
-                )
-
-            st.markdown(
-                (
-                    "<table style='width:100%;border-collapse:collapse;border:1px solid #8f8f8f;margin:70px 0 20px 0;'>"
-                    "<thead><tr>"
-                    "<th style='border:1px solid #8f8f8f;padding:4px 6px;text-align:left;width:20%;'>Metric</th>"
-                    "<th style='border:1px solid #8f8f8f;padding:4px 6px;text-align:left;'>Spline</th>"
-                    f"<th style='border:1px solid #8f8f8f;padding:4px 6px;text-align:left;'>{model_name}</th>"
-                    f"{header_boot}"
-                    "</tr></thead>"
-                    "<tbody>"
-                    + "".join(body)
-                    + "</tbody></table>"
-                ),
-                unsafe_allow_html=True,
-            )
-        _render_row("Predicted Label", _fmt_val(pred_label))
-
-        if manual_review_mode and isinstance(review_df, pd.DataFrame) and not review_df.empty:
-            curve_key = row.get("CurveKey")
-            if not curve_key:
-                curve_key = _make_curve_key(str(row["Test Id"]), row.get("Concentration"))
-            label_key = f"true_label_{curve_key}"
-            reviewed_key = f"reviewed_{curve_key}"
-
-            if label_key not in st.session_state:
-                true_norm = _normalize_label(row.get("true_label", row.get("final_label", pred_label)))
-                st.session_state[label_key] = true_norm if true_norm in {"Valid", "Invalid", "Unsure"} else "Unsure"
-
-            if reviewed_key not in st.session_state:
-                st.session_state[reviewed_key] = "True" if bool(row.get("Reviewed", False)) else "False"
-            elif isinstance(st.session_state[reviewed_key], bool):
-                st.session_state[reviewed_key] = "True" if st.session_state[reviewed_key] else "False"
-
-            new_final = _render_select_row(
-                "True Label",
-                ["Valid", "Invalid", "Unsure"],
-                ["Valid", "Invalid", "Unsure"].index(st.session_state[label_key]),
-                label_key,
-            )
-            reviewed_val = _render_select_row(
-                "Reviewed",
-                ["False", "True"],
-                1 if st.session_state[reviewed_key] == "True" else 0,
-                reviewed_key,
-            )
-            reviewed_bool = reviewed_val == "True"
-            label_reason_raw = out_row.get("Label Reason", row.get("Label Reason", ""))
-            label_reason_txt = ""
-            if label_reason_raw is not None and not (isinstance(label_reason_raw, float) and pd.isna(label_reason_raw)):
-                label_reason_txt = str(label_reason_raw).strip()
-            if label_reason_txt:
-                _render_row("Label Reason", label_reason_txt)
-
-            if new_final != _normalize_label(row.get("true_label", row.get("final_label", pred_label))) or reviewed_bool != bool(row.get("Reviewed", False)):
-                review_df.loc[review_df["CurveKey"] == curve_key, "true_label"] = new_final
-                review_df.loc[review_df["CurveKey"] == curve_key, "is_valid_true"] = (new_final == "Valid")
-                # Keep compatibility for components still reading final columns from review_df.
-                review_df.loc[review_df["CurveKey"] == curve_key, "is_valid_final"] = review_df.loc[review_df["CurveKey"] == curve_key, "is_valid_true"]
-                review_df.loc[review_df["CurveKey"] == curve_key, "Reviewed"] = reviewed_bool
-                st.session_state["review_df"] = review_df
-                updated_audit = _build_classifier_output(
-                    wide_df=wide_for_artifacts,
-                    out_df=out_df,
-                    review_df=review_df,
-                    manual_review_mode=True,
-                    meta_df=meta_df if isinstance(meta_df, pd.DataFrame) else out_df,
-                )
-                updated_grofit = _build_grofit_input_df(
-                    wide_df=wide_for_artifacts,
-                    out_df=out_df,
-                    review_df=review_df,
-                    manual_review_mode=True,
-                    meta_df=meta_df if isinstance(meta_df, pd.DataFrame) else out_df,
-                    audit_df=updated_audit,
-                )
-                results["audit_df"] = updated_audit
-                results["grofit_df"] = updated_grofit
-                results["review_df"] = review_df
-                st.session_state["last_run_results"] = results
-                st.rerun()
-
-        # keep the rest of your existing metrics rows as-is:
-        pred_conf_text = "" if pred_label.strip().lower() == "unsure" else _fmt_metric(pred_conf_display)
-        _render_row(f"Confidence ({pred_label})", pred_conf_text)
-        _render_row("Too Sparse", _fmt_val(bool(out_row.get("too_sparse")) if "too_sparse" in out_row else "NA"))
-        _render_row("Low Resolution", _fmt_val(bool(out_row.get("low_resolution")) if "low_resolution" in out_row else "NA"))
-        _render_row(
-            "Blank subtraction mode",
-            _fmt_val("RAW (applied)" if settings.input_is_raw else "ALREADY BLANK SUBTRACTED (so not applied)"),
-        )
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        with st.expander("How this plot is built?", expanded=False):
-            st.markdown(
-                "- Timepoints are extracted from column headers like `T1.0 (h)` and sorted numerically.\n"
-                "- Values come from the preprocessed table after interpolation, smoothing, and blank handling.\n"
-                "- Y-axis is Relative OD.\n"
-                "- Plot shows Raw vs Processed curves."
-            )
-        st.markdown("---")
-        st.markdown("#### Debug Downloads")
-        zip_name = results.get("zip_name") or f"outputs_{file_stem}.zip"
-        st.download_button(
-            "Download zip file",
-            data=zip_bytes,
-            file_name=zip_name,
-            mime="application/zip",
-            disabled=not zip_ready,
-            use_container_width=True,
-            help="Enabled only after the pipeline (Grofit) completes.",
-        )
-        st.download_button(
-            "Download Classifier Auditing.csv",
-            data=audit_df.to_csv(index=False).encode("utf-8"),
-            file_name="Classifier Auditing.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-
-    st.markdown("---")
-    if not dr_available:
-        with st.expander("Dose Response", expanded=False):
-            if not isinstance(gc_fit, pd.DataFrame) or gc_fit.empty:
-                st.info("Dose-response results are not available yet. Run the pipeline first.")
-            else:
-                dr_c1, dr_c2, dr_c3 = st.columns([1.2, 1.2, 1.2])
-                response_metric = dr_c1.selectbox(
-                    "Metric",
-                    options=["mu", "A", "lambda", "integral"],
-                    index=0,
-                    key="dr_metric_select",
-                )
-
-                if manual_review_mode:
-                    label_source = dr_c2.selectbox(
+            with right_dr:
+                st.markdown("#### Configuration & Metrics")
+                with st.container(border=True):
+                    st.markdown("**Filters**")
+                    response_metric = st.selectbox(
+                        "Metric to evaluate",
+                        options=["mu", "A", "lambda", "integral"],
+                        index=0,
+                        key="dr_metric_tab",
+                    )
+                    label_source = st.selectbox(
                         "Label source",
                         options=["final", "pred"],
-                        index=0,
-                        key="dr_label_source_select",
+                        index=0 if manual_review_mode else 1,
+                        key="dr_label_source_tab",
                     )
-                else:
-                    label_source = "pred"
-                    dr_c2.markdown("**Label source:** predicted")
+                    f_col1, f_col2 = st.columns(2)
+                    include_unsure = f_col1.checkbox("Include 'Unsure'", value=False, key="dr_inc_unsure_tab")
+                    include_invalid = f_col2.checkbox("Include 'Invalid'", value=False, key="dr_inc_invalid_tab")
 
-                show_bootstrap = dr_c3.checkbox(
-                    "Show bootstrap CI",
-                    value=bool(isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty),
-                    key="dr_show_bootstrap",
-                    disabled=not bool(isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty),
-                )
-
-                filt_c1, filt_c2 = st.columns(2)
-                include_unsure = filt_c1.checkbox("Include unsure", value=False, key="dr_inc_unsure")
-                include_invalid = filt_c2.checkbox("Include invalid", value=False, key="dr_inc_invalid")
-
-                dr_payload = build_dr_payload(
+                tab_dr_payload = build_dr_payload(
                     gc_fit=gc_fit,
                     labels_df=labels_df,
                     dr_boot=dr_boot,
@@ -2348,27 +2363,161 @@ def render_results(results: dict):
                     include_invalid=include_invalid,
                     dr_s=grofit_opts.dr_s,
                     dr_x_transform=grofit_opts.dr_x_transform,
-                    show_bootstrap=show_bootstrap,
+                    show_bootstrap=True,
                 )
-                dr_fig = make_dr_plot(dr_payload, show_bootstrap=show_bootstrap)
-                st.plotly_chart(dr_fig, use_container_width=True)
 
-                ec50 = _to_numeric_scalar(dr_payload.get("fit", {}).get("ec50"))
-                y_mid = _to_numeric_scalar(dr_payload.get("fit", {}).get("y_mid"))
-                boot = dr_payload.get("bootstrap", {})
+                fit_payload = tab_dr_payload.get("fit", {})
+                ec50 = _to_numeric_scalar(fit_payload.get("ec50"))
+                y_mid = _to_numeric_scalar(fit_payload.get("y_mid"))
+                dr_method = fit_payload.get("dr_method")
+                ec50_status = fit_payload.get("ec50_status")
+                boot = tab_dr_payload.get("bootstrap", {})
                 ec50_ci = boot.get("ec50_ci") if boot.get("ran") else None
                 ec50_lo = _to_numeric_scalar(ec50_ci[0]) if ec50_ci and len(ec50_ci) == 2 else np.nan
                 ec50_hi = _to_numeric_scalar(ec50_ci[1]) if ec50_ci and len(ec50_ci) == 2 else np.nan
+                n_points = int(tab_dr_payload.get("n_points", 0))
+                excluded = int(tab_dr_payload.get("excluded", 0))
 
-                info_c1, info_c2, info_c3 = st.columns(3)
-                info_c1.metric("EC50", f"{ec50:.4g}" if np.isfinite(ec50) else "NA")
-                info_c2.metric(
-                    "EC50 CI",
-                    f"{ec50_lo:.4g}-{ec50_hi:.4g}" if np.isfinite(ec50_lo) and np.isfinite(ec50_hi) else "NA",
-                )
-                info_c3.metric("Points used", int(dr_payload.get("n_points", 0)))
-                if dr_payload.get("excluded", 0) > 0:
-                    st.caption(f"Excluded due to labels: {dr_payload.get('excluded')}")
+                with st.container(border=True):
+                    st.markdown("**Results**")
+                    st.metric("EC50", f"{ec50:.4g}" if np.isfinite(ec50) else "NA")
+                    st.metric(
+                        "95% CI",
+                        f"{ec50_lo:.4g} - {ec50_hi:.4g}" if np.isfinite(ec50_lo) and np.isfinite(ec50_hi) else "NA",
+                    )
+                    st.metric("Mid-Point Response", f"{y_mid:.4g}" if np.isfinite(y_mid) else "NA")
+                    if dr_method:
+                        st.markdown(f"**Fit Method:** `{dr_method}`")
+                    if ec50_status:
+                        st.markdown(f"**EC50 Status:** `{ec50_status}`")
+                    st.divider()
+                    st.metric("Points Used", n_points)
+                    if excluded > 0:
+                        st.caption(f"Excluded points: {excluded}")
+
+            with left_dr:
+                st.markdown("#### Dose-Response Curve")
+                if manual_review_mode:
+                    show_dr_boot = st.pills(
+                        "",
+                        ["Bootstrap CI"],
+                        selection_mode="multi",
+                        default=["Bootstrap CI"] if boot.get("ran") else [],
+                        key="dr_overlay_pills_tab",
+                    )
+                    show_dr_bootstrap = "Bootstrap CI" in show_dr_boot
+                else:
+                    show_dr_bootstrap = False
+                dr_fig = make_dr_plot(tab_dr_payload, show_bootstrap=show_dr_bootstrap)
+                dr_fig.update_layout(height=600)
+                st.plotly_chart(dr_fig, use_container_width=True)
+
+    if st.session_state.get("trigger_grofit_run"):
+        st.session_state["trigger_grofit_run"] = False
+        if manual_review_mode:
+            gc_bootstrap = st.session_state.get("exit_gc_bootstrap", "None")
+            preferred_model = st.session_state.get("exit_preferred_model", "Best Model")
+            response_metric = st.session_state.get("exit_response_metric", "mu")
+            dr_bootstrap = st.session_state.get("exit_dr_bootstrap", "True")
+            with st.spinner("Preparing Grofit raw file (raw OD + final labels) and running Grofit..."):
+                grofit_source_df = results.get("grofit_df")
+                if not isinstance(grofit_source_df, pd.DataFrame) or grofit_source_df.empty:
+                    grofit_source_df = _build_grofit_input_df(
+                        wide_df=wide_original,
+                        out_df=out_df,
+                        review_df=review_df,
+                        manual_review_mode=True,
+                        meta_df=results.get("meta_df", out_df),
+                        audit_df=results.get("audit_df"),
+                    )
+                grofit_tidy_all = wide_original_to_grofit_tidy(grofit_source_df, file_tag=file_stem)
+                true_map = grofit_source_df.set_index("Test Id")["True Label"].to_dict() if "True Label" in grofit_source_df.columns else {}
+                grofit_tidy_all["true_label"] = grofit_tidy_all["curve_id"].map(true_map).apply(_normalize_label)
+                grofit_tidy_all["is_valid_true"] = grofit_tidy_all["true_label"].map(_label_is_valid).fillna(False).astype(bool)
+
+                preferred_fit_map = {
+                    "Best Model": "Both (param + spline)",
+                    "Spline": "Spline only",
+                    "Parametric": "Parametric only",
+                }
+                fit_opt_map = {
+                    "Both (param + spline)": "b",
+                    "Parametric only": "m",
+                    "Spline only": "s",
+                }
+                fit_mode_label = preferred_fit_map.get(preferred_model, "Both (param + spline)")
+                fit_opt = fit_opt_map.get(fit_mode_label, "b")
+
+                gc_boot_B = 0 if gc_bootstrap == "None" else grofit_opts.gc_boot_B
+                dr_boot_B = grofit_opts.dr_boot_B if dr_bootstrap == "True" else 0
+                validity_col = "__all__"
+
+                gc_fit = pd.DataFrame()
+                dr_fit = pd.DataFrame()
+                gc_boot = pd.DataFrame()
+                dr_boot = pd.DataFrame()
+                zip_bytes = b""
+                zip_name = ""
+
+                boot_list = st.session_state.get("bootstrap_curve_ids", [])
+                grofit_tidy_all_all = grofit_tidy_all.copy()
+                grofit_tidy_all_all["is_valid_true"] = True
+                curves_for_run = grofit_tidy_all_all if (gc_bootstrap == "Custom List" and boot_list) else grofit_tidy_all
+
+                if not grofit_tidy_all.empty:
+                    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as grofit_td:
+                        grofit_res = run_grofit_pipeline(
+                            curves_df=curves_for_run,
+                            response_var=response_metric,
+                            have_atleast=grofit_opts.have_atleast,
+                            gc_boot_B=gc_boot_B,
+                            dr_boot_B=dr_boot_B,
+                            spline_auto_cv=grofit_opts.spline_auto_cv,
+                            spline_s=grofit_opts.spline_s,
+                            dr_x_transform=grofit_opts.dr_x_transform,
+                            dr_s=grofit_opts.dr_s,
+                            fit_opt=fit_opt,
+                            bootstrap_method=grofit_opts.bootstrap_method,
+                            validity_col=validity_col,
+                            random_state=42,
+                            export_dir=Path(grofit_td),
+                        )
+                        gc_fit = grofit_res.get("gc_fit", pd.DataFrame())
+                        dr_fit = grofit_res.get("dr_fit", pd.DataFrame())
+                        gc_boot = grofit_res.get("gc_boot", pd.DataFrame())
+                        dr_boot = grofit_res.get("dr_boot", pd.DataFrame())
+                        zip_name, zip_bytes = _build_export_zip(
+                            wide_df=wide_original,
+                            out_df=out_df,
+                            review_df=review_df,
+                            gc_fit=gc_fit,
+                            gc_boot=gc_boot,
+                            dr_fit=dr_fit,
+                            dr_boot=dr_boot,
+                            proc_wide_df=final_merged,
+                            grofit_opts=grofit_opts,
+                            settings=settings,
+                            mode_label="MANUAL",
+                            file_stem=file_stem,
+                            predicting_model=predicting_model,
+                            audit_df=results.get("audit_df"),
+                            grofit_df=results.get("grofit_df"),
+                            stage2_config=results.get("stage2_config"),
+                        )
+
+                if gc_bootstrap == "Custom List" and boot_list and not gc_boot.empty:
+                    gc_boot = gc_boot[gc_boot["add.id"].astype(str).isin(boot_list)].copy()
+
+            results["grofit_tidy_all"] = grofit_tidy_all
+            results["gc_fit"] = gc_fit
+            results["dr_fit"] = dr_fit
+            results["gc_boot"] = gc_boot
+            results["dr_boot"] = dr_boot
+            results["zip_bytes"] = zip_bytes
+            results["zip_name"] = zip_name if "zip_name" in locals() else ""
+            results["grofit_ran"] = True
+            st.session_state["last_run_results"] = results
+            st.rerun()
 
     st.markdown("---")
 
@@ -2802,16 +2951,10 @@ with top_left:
 
         with st.expander("Filter & Pipeline Options", expanded=False):
             response_var = auto_response_metric if auto_mode else "mu"
-            preferred_fit_map = {
-                "Best Model": "Both (param + spline)",
-                "Spline": "Spline only",
-                "Parametric": "Parametric only",
-            }
-            fit_mode_options = ["Both (param + spline)", "Parametric only", "Spline only"]
-            fit_mode_default = preferred_fit_map.get(auto_preferred_model, "Both (param + spline)")
-            fit_mode_index = fit_mode_options.index(fit_mode_default) if auto_mode else 0
 
+            # Model Selection (Stage 1 Classifier)
             available_models = discover_models(MODEL_DIR)
+
             def _label_from_stem(stem: str) -> str:
                 s = stem.lower()
                 if "hgb" in s or "hist" in s:
@@ -2841,44 +2984,59 @@ with top_left:
             else:
                 st.warning("No trained model found. Click Train/Refresh Classifier.")
 
-            fit_opt_label = st.selectbox(
-                "Fit mode",
-                options=fit_mode_options,
-                index=fit_mode_index,
-                disabled=auto_mode,
-            )
-            have_atleast = st.number_input("Min points for dose-response", min_value=1, value=6, step=1)
-            gc_boot_B = st.number_input("GC bootstrap samples", min_value=0, value=200, step=50)
-            dr_boot_B = st.number_input("DR bootstrap samples", min_value=0, value=300, step=50)
-            bootstrap_method = st.selectbox("GC bootstrap method", options=["pairs", "residual"], index=0)
-            spline_s_str = st.text_input("GC spline smoothing (blank = auto CV)", value="")
-            dr_s_str = st.text_input("DR spline smoothing (blank = auto CV)", value="")
-            dr_x_transform = st.selectbox("DR x transform", options=["log1p", "none"], index=0)
-            if auto_mode:
-                st.caption("Fit mode is set by Auto Mode > Preferred Model.")
+            # Pipeline Mathematical Thresholds
+            st.markdown("**Grofit Parameters**")
+            have_atleast = st.number_input("Min. points required for Dose-Response", min_value=1, value=6, step=1)
 
+            c1, c2 = st.columns(2)
+            with c1:
+                gc_boot_B = st.number_input(
+                    "GC Bootstrap Iterations",
+                    min_value=0,
+                    value=200,
+                    step=50,
+                    help="Number of resamples for single curve confidence intervals.",
+                )
+            with c2:
+                dr_boot_B = st.number_input(
+                    "DR Bootstrap Iterations",
+                    min_value=0,
+                    value=300,
+                    step=50,
+                    help="Number of resamples for dose-response confidence intervals.",
+                )
+
+            dr_x_transform = st.selectbox("Dose-Response X-Axis Transform", options=["log10", "log1p", "none"], index=0)
+
+            st.markdown("**Blank Handling**")
             input_is_raw = st.checkbox("Input is raw (apply blank subtraction)", value=False)
             global_blank_str = ""
             if input_is_raw:
-                global_blank_str = st.text_input("Global blank value (optional)", value="")
+                global_blank_str = st.text_input(
+                    "Global blank value (optional)",
+                    value="",
+                    help="Leave blank to calculate dynamically from the first few points of each curve.",
+                )
 
-            fit_opt_map = {
-                "Both (param + spline)": "b",
-                "Parametric only": "m",
-                "Spline only": "s",
+            # Hardcoded Mathematical Defaults (Hidden from Biologists to prevent errors)
+            preferred_fit_map = {
+                "Best Model": "b",
+                "Spline": "s",
+                "Parametric": "m",
             }
             dr_boot_B_effective = 0 if (auto_mode and auto_dr_bootstrap == "False") else int(dr_boot_B)
+
             grofit_opts = GrofitOptions(
                 response_var=response_var,
                 have_atleast=int(have_atleast),
-                fit_opt=fit_opt_map.get(fit_opt_label, "b"),
+                fit_opt=preferred_fit_map.get(auto_preferred_model if auto_mode else "Best Model", "b"),
                 gc_boot_B=int(gc_boot_B),
                 dr_boot_B=dr_boot_B_effective,
                 spline_auto_cv=True,
-                spline_s=_safe_float(spline_s_str, None),
-                dr_s=_safe_float(dr_s_str, None),
+                spline_s=None,  # Mathematically forced to GCV in backend
+                dr_s=None,  # Mathematically forced to DR constraints in backend
                 dr_x_transform=None if dr_x_transform == "none" else dr_x_transform,
-                bootstrap_method=bootstrap_method,
+                bootstrap_method="residual",  # Standardized for splines
             )
         st.session_state["grofit_opts"] = grofit_opts
         settings = InferenceSettings(
@@ -3002,6 +3160,7 @@ if run:
                 review_df=review_df if manual_review_mode else None,
                 manual_review_mode=manual_review_mode,
                 meta_df=infer_res.get("meta_df", out_df),
+                processed_wide_df=final_merged,
             )
             grofit_df = _build_grofit_input_df(
                 wide_df=wide_df,
@@ -3106,6 +3265,7 @@ if run:
                                 gc_boot=gc_boot,
                                 dr_fit=dr_fit,
                                 dr_boot=dr_boot,
+                                proc_wide_df=final_merged,
                                 audit_df=audit_df,
                                 grofit_df=grofit_df,
                                 grofit_opts=grofit_opts,
@@ -3171,3 +3331,4 @@ if not run and results:
             render_results(results)
     except Exception as e:
         show_friendly_error(e)
+

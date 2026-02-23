@@ -88,7 +88,7 @@ def inject_negative_outliers(y: pd.Series, frac: float, scale_min: float, scale_
     k = max(1, int(round(frac * n)))
     idx = rng.choice(n, size=min(k, n), replace=False)
     sub = rng.uniform(scale_min, scale_max, size=len(idx))
-    y.iloc[idx] = (y.iloc[idx].values - sub).clip(min=0.0)
+    y.iloc[idx] = y.iloc[idx].values - sub
     return y
 
 def make_obvious_invalid(y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -441,7 +441,7 @@ def generate_bucket_synthetic_df(
             subtype_label = f"invalid_{subtype}"
 
         noise_std = noise_level * 0.3 if (is_valid and rng.random() < pct_high_quality_valid) else noise_level
-        y = (y + rng.normal(0, noise_std, size=y.shape)).clip(min=0.0)
+        y = y + rng.normal(0, noise_std, size=y.shape)
 
         if is_valid:
             if rng.random() < pct_missing_curves:
@@ -881,7 +881,7 @@ def main():
 
         # noise / clamp
         noise_std = args.noise_level * 0.3 if (is_valid and rng.random() < args.pct_high_quality_valid) else args.noise_level
-        y = (y + rng.normal(0, noise_std, size=y.shape)).clip(min=0.0)
+        y = y + rng.normal(0, noise_std, size=y.shape)
 
         # optional missing/outlier corruption (keep existing knobs; do not stack on invalids)
         if is_valid:

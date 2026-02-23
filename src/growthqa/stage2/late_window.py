@@ -5,7 +5,6 @@ from typing import Mapping
 
 import numpy as np
 import pandas as pd
-from scipy.signal import savgol_filter
 
 from growthqa.preprocess.timegrid import parse_time_from_header
 
@@ -258,16 +257,10 @@ def compute_late_features(wide_row: pd.Series, time_cols: list[str], cfg: Stage2
         return out
 
     sigma_noise = 0.0
-    if y_early.size >= 3:
-        n_early = int(y_early.size)
-        w = min(5, n_early if (n_early % 2 == 1) else (n_early - 1))
-        if w >= 3:
-            try:
-                poly = min(2, w - 1)
-                y_early_s = savgol_filter(y_early, window_length=w, polyorder=poly, mode="interp")
-                sigma_noise = float(np.nanstd(y_early - y_early_s))
-            except Exception:
-                sigma_noise = 0.0
+    baseline_pool = y_early if y_early.size else y
+    n_base = int(min(5, baseline_pool.size))
+    if n_base >= 3:
+        sigma_noise = float(np.nanstd(baseline_pool[:n_base]))
     out["sigma_noise"] = float(sigma_noise)
 
     dt_early = np.diff(t_early) if t_early.size >= 2 else np.array([], dtype=float)

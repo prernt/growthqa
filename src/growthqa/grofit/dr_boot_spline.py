@@ -26,14 +26,48 @@ def dr_boot_spline(
     if n < 6:
         return {"success": False, "message": "Need >=6 points for DR bootstrap", "n": n}
 
+    # Pre-fit once and lock smoothing to avoid repeated GCV inside bootstrap loop.
+    locked_s = s
+    if locked_s is None:
+        base_fit = dr_fit_spline(
+            x,
+            y,
+            x_transform=x_transform,
+            s=None,
+            auto_cv=True,
+            enforce_monotonic=False,
+            fallback_to_4pl=False,
+        )
+        if not base_fit.get("success"):
+            return {"success": False, "message": "Base DR spline fit failed while estimating smoothing", "n": n}
+        s_guess = base_fit.get("lam", base_fit.get("s", np.nan))
+        try:
+            s_num = float(s_guess)
+        except Exception:
+            s_num = np.nan
+        locked_s = float(s_num) if np.isfinite(s_num) else None
+
     ec50s = []
     for _ in range(B):
         idx = rng.integers(0, n, size=n)
         xb = x[idx]
         yb = y[idx]
-        fit = dr_fit_spline(xb, yb, x_transform=x_transform, s=s, auto_cv=(s is None))
-        if fit.get("success") and np.isfinite(fit.get("ec50", np.nan)):
-            ec50s.append(float(fit["ec50"]))
+        fit = dr_fit_spline(
+            xb,
+            yb,
+            x_transform=x_transform,
+            s=locked_s,
+            auto_cv=False,
+            enforce_monotonic=True,
+            fallback_to_4pl=True,
+        )
+        ec50 = fit.get("ec50", np.nan) if fit.get("success") else np.nan
+        try:
+            ec50 = float(ec50)
+        except Exception:
+            ec50 = np.nan
+        if np.isfinite(ec50):
+            ec50s.append(ec50)
 
     ec50s = np.asarray(ec50s, float)
     if len(ec50s) == 0:

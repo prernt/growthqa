@@ -126,6 +126,44 @@ def start_values_lowess(t: np.ndarray, y: np.ndarray) -> Dict[str, np.ndarray]:
     }
     return starts
 
+def _extract_analytical_mu_lag(
+    model_name: str,
+    params: np.ndarray,
+) -> tuple[float, float]:
+    name = str(model_name).lower()
+    p = np.asarray(params, dtype=float)
+
+    if name == "modified_gompertz" and p.size >= 4:
+        return float(p[2]), float(p[3])
+
+    if name in {"logistic", "gompertz"} and p.size >= 4:
+        A = float(p[1])
+        k = float(p[2])
+        t0 = float(p[3])
+        if k <= 1e-12 or A <= 0.0:
+            return float("nan"), float("nan")
+        if name == "logistic":
+            mu = (A * k) / 4.0
+            lag = t0 - (2.0 / k)
+            return float(mu), float(lag)
+        mu = (A * k) / np.e
+        lag = t0 - (1.0 / k)
+        return float(mu), float(lag)
+
+    if name == "richards" and p.size >= 5:
+        A = float(p[1])
+        k = float(p[2])
+        t0 = float(p[3])
+        nu = float(p[4])
+        if k <= 1e-12 or A <= 0.0 or nu <= 1e-12:
+            return float("nan"), float("nan")
+        mu = A * k * np.power(1.0 + nu, -(1.0 / nu) - 1.0)
+        lag = t0 - ((1.0 + nu) / k)
+        return float(mu), float(lag)
+
+    return float("nan"), float("nan")
+
+
 def extract_grofit_params_from_curve(
     model_name: str,
     t: np.ndarray,
@@ -134,20 +172,29 @@ def extract_grofit_params_from_curve(
     fitted_func: Callable[[np.ndarray], np.ndarray],
     t_min: float,
     t_max: float,
+    params: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """
-    Derive mu, lag, integral from fitted curve numerically (stable across models).
+    Derive grofit-aligned parameters from fitted parametric models.
+    Prefer analytical mu/lag from optimized model parameters when available.
     """
     t_grid = np.linspace(t_min, t_max, 400)
     y_grid = fitted_func(t_grid)
-    mu, t_star = _finite_diff_max_slope(t_grid, y_grid)
-    y_star = float(np.interp(t_star, t_grid, y_grid))
-    lag = _estimate_lag_from_tangent(t_star, y_star, mu, y0)
+    mu = float("nan")
+    lag = float("nan")
+
+    if params is not None:
+        mu, lag = _extract_analytical_mu_lag(model_name=model_name, params=np.asarray(params, dtype=float))
+
+    if not np.isfinite(mu) or not np.isfinite(lag):
+        mu_num, t_star = _finite_diff_max_slope(t_grid, y_grid)
+        y_star = float(np.interp(t_star, t_grid, y_grid))
+        mu = float(mu_num)
+        lag = _estimate_lag_from_tangent(t_star, y_star, mu, y0)
 
     integral = float(np.trapz(y_grid, t_grid))
 
-    # For A: we prefer amplitude in growth sense: max(y) - baseline
-    A_est = float(np.nanmax(y_grid) - y0)
-    A_est = max(A_est, 0.0)
+    # Parametric A should be the model asymptote parameter (not baseline-subtracted delta).
+    A_est = float(A)
 
     return {"mu": mu, "lag": lag, "A": A_est, "integral": integral}

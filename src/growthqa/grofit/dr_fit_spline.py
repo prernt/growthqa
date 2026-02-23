@@ -4,56 +4,23 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 import numpy as np
-from scipy.interpolate import UnivariateSpline
+from scipy.interpolate import make_smoothing_spline
 
 from .dr_fit_model import dr_fit_model
 from .parametric_models import aic_from_rss
 
 
-def _cv_mse_for_spline(
-    x: np.ndarray,
-    y: np.ndarray,
-    s: float,
-    *,
-    k_folds: int,
-    k_spline: int,
-) -> float:
-    n = len(x)
-    k_folds = max(2, min(int(k_folds), n))
-    idx = np.arange(n)
-    folds = np.array_split(idx, k_folds)
-    errs = []
-    for val_idx in folds:
-        train_idx = np.setdiff1d(idx, val_idx)
-        if len(train_idx) <= k_spline:
-            continue
-        try:
-            sp = UnivariateSpline(x[train_idx], y[train_idx], k=k_spline, s=float(s))
-            y_hat = sp(x[val_idx])
-            errs.append(float(np.mean((y[val_idx] - y_hat) ** 2)))
-        except Exception:
-            continue
-    if not errs:
-        return float("inf")
-    return float(np.mean(errs))
-
-
-def _auto_select_s(
-    x: np.ndarray,
-    y: np.ndarray,
-    s_grid: np.ndarray,
-    *,
-    k_folds: int,
-    k_spline: int,
-) -> float:
-    best_s = float(s_grid[0])
-    best = float("inf")
-    for s in s_grid:
-        score = _cv_mse_for_spline(x, y, float(s), k_folds=k_folds, k_spline=k_spline)
-        if score < best:
-            best = score
-            best_s = float(s)
-    return best_s
+def _dedupe_sorted_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if x.size <= 1:
+        return x, y
+    xu, inv = np.unique(x, return_inverse=True)
+    if xu.size == x.size:
+        return x, y
+    y_sum = np.zeros_like(xu, dtype=float)
+    cnt = np.zeros_like(xu, dtype=float)
+    np.add.at(y_sum, inv, y)
+    np.add.at(cnt, inv, 1.0)
+    return xu, y_sum / np.maximum(cnt, 1.0)
 
 
 def _is_monotonic(deriv: np.ndarray, eps: float) -> bool:
@@ -115,7 +82,7 @@ def _pick_ec50_crossing(
 def dr_fit_spline(
     conc: np.ndarray,
     resp: np.ndarray,
-    x_transform: Optional[str] = "log1p",
+    x_transform: Optional[str] = "log10",
     s: Optional[float] = None,
     auto_cv: bool = True,
     *,
@@ -132,7 +99,23 @@ def dr_fit_spline(
     if len(x) < 4:
         return {"success": False, "message": "Need >=4 points for dose-response", "n": len(x)}
 
-    if x_transform == "log1p":
+    # Defensive: treat non-finite smoothing inputs as "not provided".
+    if s is not None:
+        try:
+            s_num = float(s)
+        except Exception:
+            s_num = np.nan
+        s = s_num if np.isfinite(s_num) else None
+
+    x_transform_norm = (x_transform or "none").strip().lower()
+    if x_transform_norm in {"log10", "log"}:
+        pos = x[x > 0]
+        if pos.size == 0:
+            return {"success": False, "message": "Need at least one positive concentration for log10 transform", "n": len(x)}
+        pseudo = max(float(np.nanmin(pos)) / 10.0, 1e-12)
+        x_for_log = np.where(x > 0, x, pseudo)
+        xt = np.log10(x_for_log)
+    elif x_transform_norm == "log1p":
         xt = np.log1p(x)
     else:
         xt = x
@@ -141,56 +124,50 @@ def dr_fit_spline(
     xt = xt[order]
     x = x[order]
     y = y[order]
+    # Keep x/y/xt aligned after deduplication on transformed x.
+    xt_u, inv = np.unique(xt, return_inverse=True)
+    if xt_u.size != xt.size:
+        y_sum = np.zeros_like(xt_u, dtype=float)
+        x_sum = np.zeros_like(xt_u, dtype=float)
+        cnt = np.zeros_like(xt_u, dtype=float)
+        np.add.at(y_sum, inv, y)
+        np.add.at(x_sum, inv, x)
+        np.add.at(cnt, inv, 1.0)
+        xt = xt_u
+        y = y_sum / np.maximum(cnt, 1.0)
+        x = x_sum / np.maximum(cnt, 1.0)
 
-    k_spline = min(3, len(xt) - 1)
+    if len(xt) < 4:
+        return {"success": False, "message": "Need >=4 unique points for dose-response", "n": len(xt)}
 
-    if s is None and auto_cv:
-        scale = float(np.nanvar(y) * len(y))
-        s_grid = np.logspace(-3, 2, 20) * max(scale, 1e-6)
-        k_folds = min(5, len(xt))
-        s_fit = _auto_select_s(xt, y, s_grid, k_folds=k_folds, k_spline=k_spline)
-    elif s is None:
-        s_fit = float(np.nanvar(y) * len(y))
+    # NOTE: keep `s` argument for API compatibility; it maps to smoothing lambda (`lam`).
+    lam_fit: Optional[float]
+    if auto_cv:
+        # MATHEMATICAL FIX: GCV (lam=None) severely over-smooths sparse DR data into flat lines.
+        # We force a light smoothing penalty (0.001) to preserve the biological S-curve shape.
+        lam_fit = 0.001 if s is None else float(max(float(s), 0.0))
     else:
-        s_fit = float(s)
+        if s is None:
+            lam_fit = 0.001
+        else:
+            lam_fit = float(max(float(s), 0.0))
 
-    last_err: Optional[Exception] = None
-    monotonic = False
-    sp: Optional[UnivariateSpline] = None
-    grid = np.array([], dtype=float)
-    y_hat = np.array([], dtype=float)
-    dy = np.array([], dtype=float)
-    chosen_s = float(s_fit)
+    try:
+        # GCV happens internally when lam is None, matching smooth.spline-style behavior.
+        sp = make_smoothing_spline(xt, y, lam=lam_fit)
+        grid = np.linspace(float(np.min(xt)), float(np.max(xt)), 2000)
+        y_hat = sp(grid)
+        dy = sp.derivative(1)(grid)
+        # A true sigmoidal curve has flat ends and a steep middle; a straight line has near-constant slope.
+        dy_abs = np.abs(dy)
+        is_linear = bool(np.max(dy_abs) < 1.5 * max(float(np.mean(dy_abs)), 1e-8))
 
-    for mult in [1.0, 3.0, 10.0, 30.0]:
-        try:
-            candidate_s = float(max(1e-12, s_fit * mult))
-            sp_c = UnivariateSpline(xt, y, k=k_spline, s=candidate_s)
-            g = np.linspace(float(np.min(xt)), float(np.max(xt)), 2000)
-            yh = sp_c(g)
-            d1 = sp_c.derivative(1)(g)
-            eps = max(1e-8, 0.02 * float(np.nanstd(d1)))
-            mono = _is_monotonic(d1, eps=eps)
-            sp = sp_c
-            grid = g
-            y_hat = yh
-            dy = d1
-            monotonic = mono
-            chosen_s = candidate_s
-            if (not enforce_monotonic) or mono:
-                break
-        except Exception as e:
-            last_err = e
-            continue
+        eps = max(1e-8, 0.02 * float(np.nanstd(dy)))
+        monotonic = _is_monotonic(dy, eps=eps)
+    except Exception as e:
+        return {"success": False, "message": f"dr spline fit failed: {e}", "n": int(len(x))}
 
-    if sp is None or grid.size == 0:
-        return {
-            "success": False,
-            "message": f"dr spline fit failed: {last_err}" if last_err is not None else "dr spline fit failed",
-            "n": int(len(x)),
-        }
-
-    if enforce_monotonic and (not monotonic) and fallback_to_4pl:
+    if enforce_monotonic and ((not monotonic) or is_linear) and fallback_to_4pl:
         model_fit = dr_fit_model(x, y)
         if model_fit.get("success"):
             return {
@@ -219,7 +196,9 @@ def dr_fit_spline(
     target = 0.5 * (y0 + y1)
     ec50_xt, ec50_status = _pick_ec50_crossing(grid, y_hat, dy, target)
 
-    if x_transform == "log1p":
+    if x_transform_norm in {"log10", "log"}:
+        ec50 = float(np.power(10.0, ec50_xt)) if np.isfinite(ec50_xt) else float("nan")
+    elif x_transform_norm == "log1p":
         ec50 = float(np.expm1(ec50_xt)) if np.isfinite(ec50_xt) else float("nan")
     else:
         ec50 = float(ec50_xt) if np.isfinite(ec50_xt) else float("nan")
@@ -227,7 +206,8 @@ def dr_fit_spline(
     y_ec50 = float(np.interp(ec50_xt, grid, y_hat)) if np.isfinite(ec50_xt) else float("nan")
     residual = y - sp(xt)
     rss = float(np.sum(residual**2))
-    aic = float(aic_from_rss(rss, int(len(y)), int(k_spline + 1)))
+    aic = float(aic_from_rss(rss, int(len(y)), 4))
+    lam_out = float(lam_fit) if lam_fit is not None and np.isfinite(lam_fit) else np.nan
 
     return {
         "success": True,
@@ -235,7 +215,8 @@ def dr_fit_spline(
         "n": int(len(x)),
         "x_transform": x_transform,
         "method": "spline",
-        "s": float(chosen_s),
+        "s": lam_out,
+        "lam": lam_out,
         "ec50": ec50,
         "ec50_x_transformed": float(ec50_xt) if np.isfinite(ec50_xt) else np.nan,
         "ec50_status": ec50_status,

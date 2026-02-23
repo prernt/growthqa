@@ -36,9 +36,7 @@ def baseline_correct_curve(
     blank_subtracted: bool,
     global_blank: Optional[float],
     clip_negatives: bool,
-    early_hours: float = 0.5,
-    min_early_points: int = 3,
-    fallback_k: int = 5,
+    baseline_n_points: int = 5,
 ) -> np.ndarray:
     """
     Baseline (blank) subtraction.
@@ -47,8 +45,7 @@ def baseline_correct_curve(
       1) If blank_subtracted is False -> return y unchanged
       2) If global_blank is provided -> subtract that constant
       3) Else -> subtract robust baseline:
-           - median of early-window points (t <= early_hours)
-           - if too few points -> median of earliest fallback_k finite points
+           - median of earliest baseline_n_points finite observations
 
     Negative handling:
       - if clip_negatives True -> clamp corrected values at 0 (only for finite points)
@@ -67,17 +64,11 @@ def baseline_correct_curve(
     if global_blank is not None:
         yy[m] = yy[m] - float(global_blank)
     else:
-        # 2) robust baseline from early window
-        early_mask = m & (tt <= float(early_hours))
-
-        if np.sum(early_mask) >= int(min_early_points):
-            base = float(np.nanmedian(yy[early_mask]))
-        else:
-            # fallback: median of earliest K finite points
-            idx = np.where(m)[0]
-            idx_sorted = idx[np.argsort(tt[idx])]
-            k = min(int(fallback_k), idx_sorted.size)
-            base = float(np.nanmedian(yy[idx_sorted[:k]]))
+        # 2) robust baseline from earliest N points (time-sorted)
+        idx = np.where(m)[0]
+        idx_sorted = idx[np.argsort(tt[idx])]
+        k = min(max(int(baseline_n_points), 1), idx_sorted.size)
+        base = float(np.nanmedian(yy[idx_sorted[:k]]))
 
         yy[m] = yy[m] - base
 
@@ -254,15 +245,13 @@ def preprocess_wide(raw_wide: pd.DataFrame,
         blank_value_to_use = per_file_blank if per_file_blank is not None else global_blank
 
         y0 = baseline_correct_curve(
-        t_grid,
-        y,
-        blank_subtracted=apply_blank,
-        global_blank=blank_value_to_use,
-        clip_negatives=bool(clip_negatives),
-        early_hours=0.5,        # recommended default
-        min_early_points=3,
-        fallback_k=5,
-    )
+            t_grid,
+            y,
+            blank_subtracted=apply_blank,
+            global_blank=blank_value_to_use,
+            clip_negatives=bool(clip_negatives),
+            baseline_n_points=5,
+        )
 
 
 

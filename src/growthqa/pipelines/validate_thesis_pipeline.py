@@ -21,6 +21,7 @@ def run_validation(inputs: list[str]) -> None:
         out_raw = Path(td) / "raw.csv"
         out_final = Path(td) / "final.csv"
         out_meta = Path(td) / "meta.csv"
+        # out_meta = Path(td) / "metaNoGrofit.csv"
 
         raw, final, meta = run_merge_preprocess_meta(
             inputs=inputs,

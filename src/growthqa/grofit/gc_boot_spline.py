@@ -3,7 +3,8 @@ from __future__ import annotations
 import numpy as np
 from typing import Dict, Any, Optional, Literal
 
-from .gc_fit_spline import gc_fit_spline
+from .gc_fit_spline import spar_to_lam,gc_fit_spline
+
 
 BootstrapMethod = Literal["pairs", "residual"]
 
@@ -14,9 +15,12 @@ def gc_boot_spline(
     B: int = 200,
     ci: float = 0.95,
     random_state: Optional[int] = None,
-    spline_s: Optional[float] = None,
+    spline_s: Optional[float] = None,     # raw λ (backward compat)
+    smooth: Optional[float] = None,       # NEW item 1: spar ∈ (0,1]
+    df: Optional[float] = None,           # NEW item 1: target df
     auto_cv: bool = True,
     bootstrap_method: BootstrapMethod = "pairs",
+
 ) -> Dict[str, Any]:
     """
     Bootstrap spline parameters A, mu, lag, integral.
@@ -38,10 +42,15 @@ def gc_boot_spline(
 
     stats = {"A": [], "mu": [], "lag": [], "integral": []}
 
+    resolved_lam = spline_s
+    if smooth is not None and resolved_lam is None:
+        resolved_lam = spar_to_lam(smooth)
+
+
     # Pre-fit once and lock smoothing for all bootstrap resamples.
     locked_s = spline_s
     if locked_s is None:
-        pre_fit = gc_fit_spline(t, y, s=None, auto_cv=auto_cv)
+        pre_fit = gc_fit_spline(t, y, lam=resolved_lam, auto_cv=auto_cv, smooth=smooth, df=df)
         if not pre_fit.success:
             return {"success": False, "message": "Base spline fit failed while estimating smoothing", "n": n}
         pre_extra = pre_fit.extra or {}
@@ -60,7 +69,7 @@ def gc_boot_spline(
     resid = None
     n_resid = n
     if bootstrap_method == "residual":
-        base_fit = gc_fit_spline(t, y, s=locked_s, auto_cv=False)
+        base_fit = gc_fit_spline(t, y, lam=locked_s, auto_cv=False)
         if not base_fit.success:
             return {"success": False, "message": "Base spline fit failed for residual bootstrap", "n": n}
         try:
@@ -100,7 +109,7 @@ def gc_boot_spline(
             yb = y_fit + resid_b
             tb = tb_sorted
 
-        fit = gc_fit_spline(tb, yb, s=locked_s, auto_cv=False)
+        fit = gc_fit_spline(tb, yb, lam=locked_s, auto_cv=False)
         if fit.success:
             stats["A"].append(fit.A)
             stats["mu"].append(fit.mu)

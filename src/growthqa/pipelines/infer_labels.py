@@ -11,7 +11,6 @@ import pandas as pd
 import platform
 import sklearn
 import importlib
-import re
 from growthqa.pipelines.build_meta_dataset import run_merge_preprocess_meta
 from growthqa.preprocess.timegrid import parse_time_from_header
 from growthqa.stage2.late_window import (
@@ -335,9 +334,13 @@ def _assign_final_reason_labels(
     *,
     cfg: Stage2Config,
 ) -> pd.DataFrame:
+    # stage2_labels: list[str] = []
+    # final_labels: list[str] = []
+    # reasons: list[str] = []
     stage2_labels: list[str] = []
     final_labels: list[str] = []
     reasons: list[str] = []
+
 
     for _, row in out_df.iterrows():
         s1_label = _normalize_label_text(row.get("pred_label", ""))
@@ -361,14 +364,20 @@ def _assign_final_reason_labels(
         )
 
     out = out_df.copy()
-    out["Predicted S1 Label"] = out.get("Predicted S1 Label", out.get("pred_label", "")).astype(str)
-    out["Stage 2 Label"] = stage2_labels
-    out["Label Reason"] = reasons
-    out["Pred Label"] = final_labels
-    out["Pred Confidence"] = pd.to_numeric(out.get("pred_confidence"), errors="coerce")
-    # Backward compatibility for older consumers.
+    # out["Predicted S1 Label"] = out.get("Predicted S1 Label", out.get("pred_label", "")).astype(str)
+    # out["Stage 2 Label"] = stage2_labels
+    # out["Label Reason"] = reasons
+    # out["Pred Label"] = final_labels
+    # out["Pred Confidence"] = pd.to_numeric(out.get("pred_confidence"), errors="coerce")
+    # # Backward compatibility for older consumers.
+    # out["final_label"] = final_labels
+    # out["final_reason"] = reasons
+    out["s1_label"] = out.get("pred_label", "").astype(str)
+    out["s1_confidence_valid"] = pd.to_numeric(out.get("confidence_valid", np.nan), errors="coerce")
+    out["stage2_label"] = stage2_labels
+    out["stage2_reason"] = reasons
     out["final_label"] = final_labels
-    out["final_reason"] = reasons
+
     return out
 
 
@@ -493,12 +502,12 @@ def run_label_inference_from_uploaded_wide(
     out_df["is_valid_pred"] = out_df["pred_label"].map(_label_is_valid).astype(bool)
     out_df["Predicted S1 Label"] = out_df["pred_label"].astype(str)
     out_df["S1 Confidence Valid"] = out_df["confidence_valid"]
-    out_df["S1 Confidence Invalid"] = out_df["confidence_invalid"]
+    # out_df["S1 Confidence Invalid"] = out_df["confidence_invalid"]
     # Clarify that this tmax comes from Stage-1 early-pass preprocessing.
-    if "observed_tmax" in out_df.columns:
-        out_df["early_observed_tmax"] = pd.to_numeric(out_df["observed_tmax"], errors="coerce")
-    else:
-        out_df["early_observed_tmax"] = np.nan
+    # if "observed_tmax" in out_df.columns:
+    #     out_df["early_observed_tmax"] = pd.to_numeric(out_df["observed_tmax"], errors="coerce")
+    # else:
+    #     out_df["early_observed_tmax"] = np.nan
 
     # Stage-2 uses post-16h evidence from original wide data (never from truncated stage-1 tables).
     stage2_cfg = Stage2Config(stage2_start=float(stage2_start))
@@ -516,11 +525,12 @@ def run_label_inference_from_uploaded_wide(
         out_df,
         cfg=stage2_cfg,
     )
-    out_df["true_label"] = out_df["Pred Label"].astype(str)
-    out_df["is_valid_true"] = out_df["true_label"].map(_label_is_valid).astype(bool)
-    out_df["Reviewed"] = False
-    # Backward compatibility with existing consumers.
-    out_df["is_valid_final"] = out_df["is_valid_true"].astype(bool)
+    # out_df["true_label"] = out_df["Pred Label"].astype(str)
+    # out_df["is_valid_true"] = out_df["true_label"].map(_label_is_valid).astype(bool)
+    # out_df["Reviewed"] = False
+    # # Backward compatibility with existing consumers.
+    # out_df["is_valid_final"] = out_df["is_valid_true"].astype(bool)
+    out_df["is_valid_final"] = out_df["final_label"].map(_label_is_valid).astype(bool)
 
     if "Is_Valid" in wide_df.columns:
         out_df["Is_Valid_input"] = out_df["Test Id"].map(wide_df.set_index("Test Id")["Is_Valid"])
@@ -536,10 +546,12 @@ def run_label_inference_from_uploaded_wide(
         + "||"
         + pd.to_numeric(grofit_tidy_all.loc[has_conc_g, "concentration"], errors="coerce").map(_fmt_conc_for_key)
     )
-    pred_map_df = out_df[["curve_key", "is_valid_true", "pred_label", "final_label", "pred_confidence"]].drop_duplicates("curve_key")
-    grofit_tidy_all = grofit_tidy_all.merge(pred_map_df, on="curve_key", how="left")
-    grofit_tidy_all["is_valid_true"] = grofit_tidy_all["is_valid_true"].fillna(False).astype(bool)
+    # pred_map_df = out_df[["curve_key", "is_valid_true", "pred_label", "final_label", "pred_confidence"]].drop_duplicates("curve_key")
+    pred_map_df = out_df[["curve_key", "is_valid_final", "pred_label", "final_label", "pred_confidence"]].drop_duplicates("curve_key")
 
+    grofit_tidy_all = grofit_tidy_all.merge(pred_map_df, on="curve_key", how="left")
+    # grofit_tidy_all["is_valid_true"] = grofit_tidy_all["is_valid_true"].fillna(False).astype(bool)
+    grofit_tidy_all["is_valid_final"] = grofit_tidy_all["is_valid_final"].fillna(False).astype(bool)
     return {
         "raw_merged_df": raw_merged_df,
         "final_merged_df": final_merged_df,

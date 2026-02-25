@@ -10,7 +10,7 @@ import re
 
 
 AUDIT_META_FEATURES: list[str] = [
-    "early_observed_tmax",
+    # "early_observed_tmax",
     "raw_observed_tmax",
     "observed_tmax",
     "n_points_observed",

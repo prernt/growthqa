@@ -29,6 +29,7 @@ from growthqa.classifier.save_manifest import write_model_manifest
 
 ROOT = Path(__file__).resolve().parents[3]
 TRAIN_META_CSV = ROOT / "data" / "train_data" / "meta.csv"
+# TRAIN_META_CSV = ROOT / "data" / "output" / "metaNoGrofit.csv"
 ART_DIR = ROOT / "classifier_output" / "saved_models_selected"
 LOCKFILE_OUT = ROOT / "classifier_output" / "requirements_lock.txt"
 

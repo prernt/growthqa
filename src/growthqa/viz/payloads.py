@@ -29,7 +29,7 @@ def _spline_payload(
     spline_s: Optional[float],
     auto_cv: bool,
 ) -> dict:
-    fit = gc_fit_spline(t, y, s=spline_s, auto_cv=auto_cv)
+    fit = gc_fit_spline(t, y, lam=spline_s, auto_cv=auto_cv)
     if not fit.success:
         return {"ran": False}
     s_used = None
@@ -72,6 +72,7 @@ def _spline_payload(
         "t_grid": t_grid,
         "y_hat": y_grid,
         "dy_dt": dy,
+        "lam": float(s_used) if s_used is not None else None,
         "params": {
             "mu": float(fit.mu) if fit.mu is not None else np.nan,
             "lambda": float(fit.lag) if fit.lag is not None else np.nan,
@@ -183,8 +184,51 @@ def build_curve_payloads(
                 boot_match = boot_match[boot_match["test.id"].astype(str) == str(test_id)]
             if not boot_match.empty:
                 brow = boot_match.iloc[0]
+                # ── Compute curve-shape bootstrap band ───────────────────────
+                # gc_boot rows store per-parameter CIs but not the curve envelope.
+                # We refit the spline B=200 times using the same locked lambda to
+                # produce y_hat_q025/y_hat_q975 on the same t_grid as the orange
+                # spline curve so the band aligns exactly with it.
+                y_hat_q025 = None
+                y_hat_q975 = None
+                if spline.get("ran") and len(t_fit) >= 6:
+                    try:
+                        from scipy.interpolate import make_smoothing_spline
+                        from growthqa.grofit.gc_fit_spline import _dedupe_sorted_xy
+
+                        lam_locked = spline.get("lam")  # set by _spline_payload above
+                        lam_locked = float(lam_locked) if lam_locked is not None else None
+
+                        order = np.argsort(t_fit)
+                        t_s, y_s = t_fit[order], y_fit[order]
+                        t_u, y_u = _dedupe_sorted_xy(t_s, y_s)
+
+                        sp_base = make_smoothing_spline(t_u, y_u, lam=lam_locked)
+                        y_base  = sp_base(t_u)
+                        resid   = y_u - y_base
+
+                        t_grid = spline["t_grid"]   # reuse the exact orange-curve grid
+                        rng = np.random.default_rng(42)
+                        B = int(brow.get("nboot.fit", 200)) or 200
+                        y_boots = []
+                        for _ in range(B):
+                            y_b = y_base + rng.choice(resid, size=len(resid), replace=True)
+                            try:
+                                sp_b = make_smoothing_spline(t_u, y_b, lam=lam_locked)
+                                y_boots.append(sp_b(t_grid))
+                            except Exception:
+                                pass
+                        if len(y_boots) >= 10:
+                            arr = np.array(y_boots)
+                            y_hat_q025 = np.percentile(arr, 2.5,  axis=0)
+                            y_hat_q975 = np.percentile(arr, 97.5, axis=0)
+                    except Exception:
+                        pass  # band stays None → plot skips it gracefully
+
                 bootstrap = {
                     "ran": True,
+                    "y_hat_q025": y_hat_q025,
+                    "y_hat_q975": y_hat_q975,
                     "ci": {
                         "mu": [brow.get("ci95.mu.bt.lo"), brow.get("ci95.mu.bt.up")],
                         "lambda": [brow.get("ci95.lambda.bt.lo"), brow.get("ci95.lambda.bt.up")],
@@ -200,6 +244,8 @@ def build_curve_payloads(
             "y_raw": y_raw,
             "t_proc": t_proc,
             "y_proc": y_proc,
+            "t_fit": t_fit,
+            "y_fit": y_fit,
             "labels": labels,
             "spline": spline,
             "parametric": parametric,
@@ -271,8 +317,29 @@ def build_dr_payload(
     x = df["concentration"].to_numpy(dtype=float)
     y = df["y"].to_numpy(dtype=float)
 
-    fit = dr_fit_spline(x, y, x_transform=dr_x_transform, s=dr_s, auto_cv=(dr_s is None))
-    x_grid = fit.get("x_grid")
+    fit = dr_fit_spline(x, y, x_transform=dr_x_transform, lam=dr_s, auto_cv=(dr_s is None))
+    x_grid_raw = fit.get("x_grid")
+    method = fit.get("method")
+    # 2. Logic to handle back-transformation only if necessary
+    if x_grid_raw is not None:
+        if method == "spline":
+            # Spline returns transformed grid, needs back-transform
+            if dr_x_transform == "log1p":
+                x_grid = np.expm1(x_grid_raw)
+            elif dr_x_transform in {"log10", "log"}:
+                x_grid = np.power(10.0, x_grid_raw)
+            else:
+                x_grid = x_grid_raw
+        else:
+            # 4PL fallback or other methods already return original scale
+            x_grid = x_grid_raw
+    else:
+        # 3. Robust fallback if fit completely failed
+        x_grid = np.linspace(float(np.min(x)), float(np.max(x)), 400)
+
+    # x_grid = fit.get("x_grid")
+    # x_grid_transformed = fit.get("x_grid")          # log1p space
+    # x_grid = np.expm1(x_grid_transformed)           
     y_hat = fit.get("y_hat")
     if x_grid is None or y_hat is None:
         x_grid = np.linspace(float(np.min(x)), float(np.max(x)), 400)

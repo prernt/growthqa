@@ -10,9 +10,10 @@ def dr_boot_spline(
     resp: np.ndarray,
     B: int = 300,
     ci: float = 0.95,
+    refit_lambda: bool = False,  
     random_state: Optional[int] = None,
     x_transform: Optional[str] = "log1p",
-    s: Optional[float] = None,
+    lam: Optional[float] = None,
 ) -> Dict[str, Any]:
     rng = np.random.default_rng(random_state)
     x = np.asarray(conc, float)
@@ -27,13 +28,13 @@ def dr_boot_spline(
         return {"success": False, "message": "Need >=6 points for DR bootstrap", "n": n}
 
     # Pre-fit once and lock smoothing to avoid repeated GCV inside bootstrap loop.
-    locked_s = s
-    if locked_s is None:
+    locked_lam = lam
+    if locked_lam is None:
         base_fit = dr_fit_spline(
             x,
             y,
             x_transform=x_transform,
-            s=None,
+            lam=None,
             auto_cv=True,
             enforce_monotonic=False,
             fallback_to_4pl=False,
@@ -45,18 +46,22 @@ def dr_boot_spline(
             s_num = float(s_guess)
         except Exception:
             s_num = np.nan
-        locked_s = float(s_num) if np.isfinite(s_num) else None
+        locked_lam = float(s_num) if np.isfinite(s_num) else None
 
     ec50s = []
     for _ in range(B):
         idx = rng.integers(0, n, size=n)
         xb = x[idx]
         yb = y[idx]
+        lam_to_use = None if refit_lambda else locked_lam
+        if np.any(yb < 0):
+            yb = np.clip(yb, 0.0, None) 
+
         fit = dr_fit_spline(
             xb,
             yb,
             x_transform=x_transform,
-            s=locked_s,
+            lam=lam_to_use,
             auto_cv=False,
             enforce_monotonic=True,
             fallback_to_4pl=True,

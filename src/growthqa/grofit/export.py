@@ -1,6 +1,7 @@
 # src/growthqa/grofit/export.py
 from __future__ import annotations
 import io
+import json
 import zipfile
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -13,6 +14,7 @@ def export_results_zip(
     gc_boot: Optional[pd.DataFrame],
     dr_boot: Optional[pd.DataFrame],
     dr_audit: Optional[pd.DataFrame] = None,      # item 8: AIC audit
+    run_info:   Optional[Dict[str, Any]] = None,  
     out_dir: Path,
     zip_name: str = "grofit_outputs.zip",
     cleanup_csv: bool = True,
@@ -50,6 +52,12 @@ def export_results_zip(
     }])
     _write(manifest, "manifest.csv")
 
+    run_info_path = None
+    if run_info is not None:
+        run_info_path = out_dir / "run_info.json"
+        run_info_path.write_text(json.dumps(run_info, indent=2, sort_keys=True), encoding="utf-8")
+
+
     # Build ZIP
     zip_path = out_dir / zip_name
     bio = io.BytesIO()
@@ -57,6 +65,8 @@ def export_results_zip(
         with zipfile.ZipFile(fobj if fobj is bio else str(fobj), "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for p in csv_paths:
                 zf.write(p, arcname=p.name)
+            if run_info_path is not None and run_info_path.exists():
+                zf.write(run_info_path, arcname="run_info.json")
 
     if cleanup_csv:
         for p in csv_paths:

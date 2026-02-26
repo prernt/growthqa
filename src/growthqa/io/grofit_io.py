@@ -43,20 +43,33 @@ def build_grofit_input_df(
 
     time_cols = _sorted_time_cols(wide)
     merge_keys = ["Test Id", "Concentration"] if ("Concentration" in wide.columns and "Concentration" in audit.columns) else ["curve_id"]
-    label_cols = [c for c in ["True Label"] if c in audit.columns]
+
+    # Pull classifier result columns from audit into grofit input.
+    # "Pred Label"  = pipeline's final prediction (always present after v17).
+    # "Reviewed"    = duplicated from Pred Label by default; overwritten in MANUAL mode.
+    # "True Label"  = in MANUAL mode the user-reviewed label; in AUTO mode same as Pred Label.
+    label_cols_wanted = ["Pred Label", "True Label", "Reviewed"]
+    label_cols = [c for c in label_cols_wanted if c in audit.columns]
+
     out = wide.copy()
     if label_cols:
-        out = out.merge(audit[merge_keys + label_cols], on=merge_keys, how="left")
-    else:
-        out["True Label"] = np.nan
+        out = out.merge(audit[merge_keys + label_cols].drop_duplicates(subset=merge_keys),
+                        on=merge_keys, how="left")
+    if "Pred Label" not in out.columns:
+        out["Pred Label"] = np.nan
+    if "True Label" not in out.columns:
+        # True Label mirrors Pred Label; MANUAL mode review will overwrite it.
+        out["True Label"] = out["Pred Label"]
+    if "Reviewed" not in out.columns:
+        out["Reviewed"] = False
 
     if raw_extra_cols is None:
-        reserved = {"Test Id", "Concentration", "curve_id", "True Label", *time_cols}
+        reserved = {"Test Id", "Concentration", "curve_id", "Pred Label", "True Label", "Reviewed", *time_cols}
         raw_extra_cols = [c for c in wide.columns if c not in reserved]
     extra_cols = [c for c in raw_extra_cols if c in out.columns]
 
-    ordered = [c for c in ["Test Id", "Concentration", "True Label", "curve_id"] if c in out.columns]
+    ordered = [c for c in ["Test Id", "Concentration", "Pred Label", "True Label", "Reviewed", "curve_id"]
+               if c in out.columns]
     ordered += [c for c in time_cols if c in out.columns]
     ordered += [c for c in extra_cols if c not in ordered]
     return out[ordered].copy()
-

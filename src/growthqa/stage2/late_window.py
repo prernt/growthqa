@@ -1,463 +1,510 @@
+# src/growthqa/stage2/late_window.py
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Mapping
+from dataclasses import dataclass, asdict
+from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy import stats
+from scipy.stats import theilslopes
 
 from growthqa.preprocess.timegrid import parse_time_from_header
 
 
-S2_REASON_LATE_GROWTH = "S2_LATE_GROWTH_DETECTED"
-S2_REASON_CORROBORATION = "S2_PLATEAU_DECLINE_CORROBORATION"
-S2_REASON_ARTIFACT = "S2_POSSIBLE_ARTIFACT"
-S2_REASON_DRIFT_NOISE = "S2_DRIFT_OR_NOISE"
-S2_REASON_NO_SUPPORT = "S2_NO_LATE_SUPPORT"
-S2_REASON_NO_CHANGE = "S2_NO_CHANGE"
-S2_REASON_TOO_SPARSE_LATE = "S2_TOO_SPARSE_LATE"
-S2_REASON_ARTIFACT_EVAPORATION = "S2_REASON_ARTIFACT_EVAPORATION"
+# ============================================================
+# Revised Stage-2 (Evidence-based) + 4 defensibility tweaks
+#   Tweak 1: noise baseline from robust MAD of first differences
+#   Tweak 2: growth evidence = standardized slope (z-like, unit-consistent)
+#   Tweak 3: artifact is a SCORE (0..1), not a "probability"
+#   Tweak 4: Stage-2 outputs checker status only:
+#            Corroborated / Contradiction / Insufficient
+# ============================================================
 
 
+# ----------------------------
+# Config (simple + defensible)
+# ----------------------------
 @dataclass
-class Stage2Config:
-    # Late-window definition
+class Stage2ConfigEvidence:
+    """
+    Evidence-based Stage-2 config (thesis-friendly).
+
+    Philosophy:
+      - Stage-2 is a CHECKER, not a re-classifier.
+      - It uses late-window raw data only and produces evidence scores.
+    """
     stage2_start: float = 16.0
-    late_min_points: int = 5
 
-    # Late growth detection
-    abs_threshold: float = 0.05
-    rel_threshold: float = 0.08
-    slope_threshold: float = 0.01
-    diff_threshold: float = 0.005
+    # Quality gate
+    min_late_points: int = 5
+    quality_threshold: float = 0.30
 
-    # Plateau detection
-    plateau_slope_eps: float = 0.005
-    plateau_band: float = 0.03
-    growth_min_amplitude: float = 0.1
+    # Evidence thresholds
+    growth_z_threshold: float = 2.0          # "2-sigma" style threshold (z-like)
+    artifact_score_threshold: float = 0.70   # high artifact severity
+    unsure_margin: float = 0.10              # closeness margin around thresholds (optional)
 
-    # Decline detection
-    decline_slope_threshold: float = 0.01
-    decline_drop_threshold: float = 0.08
-    min_decline_span: float = 1.0
-
-    # Drift/noise detection
-    drift_amplitude_max: float = 0.05
-    drift_monotonicity_min: float = 0.85
-    drift_roughness_max: float = 0.02
-    noise_roughness_min: float = 0.05
-    noise_signchange_min: int = 6
-    spike_threshold: float = 0.1
-    evaporation_r2_threshold: float = 0.95
-    evaporation_quadratic_term_threshold: float = 1e-3
-
-    # Final label safeguard
-    conf_downgrade_threshold: float = 0.65
+    # Small numeric safeties
+    min_noise_level: float = 0.005           # OD units (robust floor)
+    eps_dt: float = 1e-9
 
     def to_dict(self) -> dict[str, float | int]:
         return asdict(self)
 
 
-def _normalize_label(label: object) -> str:
-    if label is None or (isinstance(label, float) and pd.isna(label)):
-        return ""
-    s = str(label).strip().lower()
-    if s in {"valid", "true", "1"}:
-        return "Valid"
-    if s in {"invalid", "false", "0"}:
-        return "Invalid"
-    if s in {"unsure", "unknown"}:
-        return "Unsure"
-    return str(label).strip()
+# ----------------------------
+# Evidence Scores
+# ----------------------------
+@dataclass
+class EvidenceScores:
+    """
+    Clean evidence quantification for Stage-2.
+
+    IMPORTANT (defensibility):
+      - growth_z_like is a standardized effect size (unit-consistent), not a literal z-score
+      - artifact_score is a bounded score in [0,1], not a calibrated probability
+    """
+    growth_z_like: float        # standardized slope evidence (z-like)
+    artifact_score: float       # [0,1] severity score (NOT probability)
+    data_quality: float         # [0,1]
+    confidence: float           # [0,1] overall decision confidence (simple mapping)
+
+    # Supporting metrics (for audit/debug)
+    late_slope: float = np.nan
+    late_delta: float = np.nan
+    noise_level: float = np.nan
+    n_late_points: int = 0
+    late_span_hours: float = np.nan
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "growth_z_like": float(self.growth_z_like),
+            "artifact_score": float(self.artifact_score),
+            "data_quality": float(self.data_quality),
+            "confidence": float(self.confidence),
+            "late_slope": float(self.late_slope) if np.isfinite(self.late_slope) else np.nan,
+            "late_delta": float(self.late_delta) if np.isfinite(self.late_delta) else np.nan,
+            "noise_level": float(self.noise_level) if np.isfinite(self.noise_level) else np.nan,
+            "n_late_points": int(self.n_late_points),
+            "late_span_hours": float(self.late_span_hours) if np.isfinite(self.late_span_hours) else np.nan,
+        }
 
 
-def _winsorize(y: np.ndarray, lo_q: float = 0.05, hi_q: float = 0.95) -> np.ndarray:
-    if y.size == 0:
-        return y
-    lo = float(np.nanquantile(y, lo_q))
-    hi = float(np.nanquantile(y, hi_q))
-    return np.clip(y, lo, hi)
+# ----------------------------
+# Helpers (robust statistics)
+# ----------------------------
+def _mad_std(x: np.ndarray) -> float:
+    """
+    Robust std estimate using MAD: sigma ~= 1.4826 * MAD.
+    Returns 0.0 if not enough finite values.
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 3:
+        return 0.0
+    med = np.nanmedian(x)
+    mad = np.nanmedian(np.abs(x - med))
+    return float(1.4826 * mad)
 
 
-def _robust_slope(t: np.ndarray, y: np.ndarray) -> float:
+def _bounded(x: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, x)))
+
+
+def _safe_float(x: Any, default: float = np.nan) -> float:
+    try:
+        v = float(x)
+        return v
+    except Exception:
+        return float(default)
+
+
+# ----------------------------
+# Tweak 1: Noise baseline
+# ----------------------------
+def compute_noise_baseline_from_diffs(
+    y_early: np.ndarray,
+    y_late: np.ndarray,
+    cfg: Stage2ConfigEvidence,
+) -> float:
+    """
+    Robust noise estimate in OD units derived from FIRST DIFFERENCES.
+
+    Why this is defensible:
+      - It measures short-term variability, not absolute level.
+      - It is robust (MAD), stable, and unit-consistent with slope standardization.
+
+    Strategy:
+      - Prefer early diffs if early exists and has enough points.
+      - Fallback to late diffs if early is insufficient.
+      - Apply minimum floor to avoid exploding standardized scores.
+    """
+    y_early = np.asarray(y_early, dtype=float)
+    y_late = np.asarray(y_late, dtype=float)
+
+    diffs = None
+    if np.isfinite(y_early).sum() >= 6:
+        ye = y_early[np.isfinite(y_early)]
+        diffs = np.diff(ye)
+    elif np.isfinite(y_late).sum() >= 6:
+        yl = y_late[np.isfinite(y_late)]
+        diffs = np.diff(yl)
+
+    sigma = _mad_std(diffs) if diffs is not None else 0.0
+    sigma = max(float(cfg.min_noise_level), float(sigma))
+    return float(sigma)
+
+
+# ----------------------------
+# Tweak 2: Growth evidence (z-like)
+# ----------------------------
+def compute_growth_evidence_z_like(
+    t_late: np.ndarray,
+    y_late: np.ndarray,
+    noise_level_od: float,
+    cfg: Stage2ConfigEvidence,
+) -> tuple[float, float, float]:
+    """
+    Computes:
+      - z_like: |TheilSenSlope| / (noise_per_hour)
+      - slope:  robust slope estimate
+      - delta:  endpoint change
+
+    Key point:
+      - noise_level_od is OD noise at the increment scale (from diffs)
+      - convert to OD/hour via median dt
+      - results are dimensionally consistent and easy to defend
+
+    Returns: (z_like, slope, delta)
+    """
+    t = np.asarray(t_late, dtype=float)
+    y = np.asarray(y_late, dtype=float)
+    m = np.isfinite(t) & np.isfinite(y)
+    t, y = t[m], y[m]
+
     if t.size < 2:
-        return float(np.nan)
+        return 0.0, np.nan, np.nan
+
+    # Sort by time
+    idx = np.argsort(t)
+    t, y = t[idx], y[idx]
+
+    # Robust slope
+    try:
+        slope, intercept, _, _ = theilslopes(y, t)
+        slope = float(slope)
+    except Exception:
+        # fallback: simple slope
+        denom = float(t[-1] - t[0])
+        slope = float((y[-1] - y[0]) / max(denom, cfg.eps_dt))
+
+    # Delta
+    delta = float(y[-1] - y[0])
+
+    # Convert OD noise to OD/hour
     dt = np.diff(t)
-    dy = np.diff(y)
-    mask = np.isfinite(dt) & np.isfinite(dy) & (np.abs(dt) > 1e-12)
-    if not np.any(mask):
-        return float(np.nan)
-    return float(np.nanmedian(dy[mask] / dt[mask]))
+    dt = dt[np.isfinite(dt) & (dt > cfg.eps_dt)]
+    dt_med = float(np.nanmedian(dt)) if dt.size > 0 else 1.0
+    noise_per_hour = float(noise_level_od / max(dt_med, cfg.eps_dt))
+
+    z_like = float(abs(slope) / max(noise_per_hour, 1e-12))
+    # Bound to keep stable and interpretable
+    z_like = _bounded(z_like, 0.0, 50.0)
+
+    return z_like, slope, delta
 
 
-def _roughness(y: np.ndarray) -> float:
-    if y.size < 3:
-        return float(np.nan)
-    d1 = np.diff(y)
-    return float(np.nanmedian(np.abs(np.diff(d1))))
+# ----------------------------
+# Tweak 3: Artifact SCORE (not probability)
+# ----------------------------
+def compute_artifact_score(
+    t_late: np.ndarray,
+    y_late: np.ndarray,
+    noise_level_od: float,
+    cfg: Stage2ConfigEvidence,
+) -> float:
+    """
+    Returns artifact_score in [0,1] (severity score).
 
+    Indicators (simple + defensible):
+      1) Excessive relative variability (CV-like)
+      2) High oscillation rate AFTER noise-thresholding on diffs
+      3) Evaporation-like linear decline (soft score using R^2)
 
-def _monotonicity_fraction(diffs: np.ndarray, eps: float) -> float:
-    if diffs.size == 0:
-        return float(np.nan)
-    sig = diffs[np.abs(diffs) > eps]
-    if sig.size == 0:
-        return 1.0
-    pos = float(np.mean(sig > 0))
-    neg = float(np.mean(sig < 0))
-    return max(pos, neg)
+    NOTE:
+      - This is a SCORE, not a calibrated probability.
+    """
+    t = np.asarray(t_late, dtype=float)
+    y = np.asarray(y_late, dtype=float)
+    m = np.isfinite(t) & np.isfinite(y)
+    t, y = t[m], y[m]
 
+    if t.size < 3:
+        return 0.5
 
-def _sign_changes(diffs: np.ndarray, eps: float) -> int:
-    if diffs.size == 0:
-        return 0
-    sig = diffs[np.abs(diffs) > eps]
-    if sig.size < 2:
-        return 0
-    s = np.sign(sig)
-    return int(np.sum(s[1:] * s[:-1] < 0))
+    # Sort
+    idx = np.argsort(t)
+    t, y = t[idx], y[idx]
 
+    indicators: list[float] = []
 
-def _sustained_positive(diffs: np.ndarray, thr: float) -> bool:
-    if diffs.size == 0:
-        return False
-    k = int(max(2, min(3, diffs.size)))
-    run = 0
-    for d in diffs:
-        if d > thr:
-            run += 1
-            if run >= k:
-                return True
+    # (1) Relative variability indicator
+    mu = float(np.nanmean(y))
+    sd = float(np.nanstd(y))
+    cv = sd / max(abs(mu), 1e-9)
+    # Map CV to 0..1 (CV ~0.05 low, CV >=0.20 high)
+    cv_score = _bounded((cv - 0.05) / (0.20 - 0.05), 0.0, 1.0)
+    indicators.append(cv_score)
+
+    # (2) Oscillation indicator (noise-thresholded sign changes)
+    diffs = np.diff(y)
+    if diffs.size >= 2 and np.isfinite(noise_level_od) and noise_level_od > 0:
+        # Only consider "meaningful" diffs
+        eps = float(2.0 * noise_level_od)
+        sig = diffs[np.abs(diffs) > eps]
+        if sig.size >= 2:
+            s = np.sign(sig)
+            sc = int(np.sum(np.diff(s) != 0))
+            osc_score = _bounded(sc / max(sig.size - 1, 1), 0.0, 1.0)
         else:
-            run = 0
-    frac_pos = float(np.mean(diffs > thr))
-    return frac_pos >= 0.7
+            osc_score = 0.0
+    else:
+        osc_score = 0.0
+    indicators.append(osc_score)
+
+    # (3) Evaporation-like linear decline (soft)
+    evap_score = 0.0
+    if t.size >= 4:
+        try:
+            slope, intercept, r_value, _, _ = stats.linregress(t, y)
+            r2 = float(r_value * r_value)
+            # strong linear decrease yields higher score
+            if slope < -0.005:
+                evap_score = _bounded(r2, 0.0, 1.0)
+        except Exception:
+            evap_score = 0.0
+    indicators.append(evap_score)
+
+    # Combine: mean keeps it simple; max tends to be too aggressive.
+    score = float(np.nanmean(indicators))
+    score = _bounded(score, 0.0, 1.0)
+    return score
 
 
-def _extract_curve_arrays(wide_row: pd.Series, time_cols: list[str]) -> tuple[np.ndarray, np.ndarray]:
-    t = np.array([parse_time_from_header(str(c)) for c in time_cols], dtype=float)
-    y = pd.to_numeric(wide_row[time_cols], errors="coerce").to_numpy(dtype=float)
-    mask = np.isfinite(t) & np.isfinite(y)
-    t = t[mask]
-    y = y[mask]
-    if t.size:
-        order = np.argsort(t)
-        t = t[order]
-        y = y[order]
-    return t, y
+# ----------------------------
+# Data quality score
+# ----------------------------
+def compute_data_quality(
+    t_late: np.ndarray,
+    y_late: np.ndarray,
+    cfg: Stage2ConfigEvidence,
+) -> float:
+    """
+    Quality score in [0,1].
+
+    Components (simple + defensible):
+      - size adequacy
+      - span adequacy
+      - finite ratio
+    """
+    t = np.asarray(t_late, dtype=float)
+    y = np.asarray(y_late, dtype=float)
+    m = np.isfinite(t) & np.isfinite(y)
+    t, y = t[m], y[m]
+
+    if t.size < cfg.min_late_points:
+        return 0.0
+
+    # Sort
+    idx = np.argsort(t)
+    t, y = t[idx], y[idx]
+
+    size_quality = min(1.0, t.size / max(2 * cfg.min_late_points, 1))
+    span = float(t[-1] - t[0])
+    span_quality = min(1.0, span / 4.0)  # prefer >=4h late span
+    finite_quality = 1.0  # already filtered finite
+
+    q = float(np.mean([size_quality, span_quality, finite_quality]))
+    return _bounded(q, 0.0, 1.0)
 
 
-def compute_has_late_data_from_raw(
+# ----------------------------
+# Evidence computation (main)
+# ----------------------------
+def compute_evidence_scores(
     wide_row: pd.Series,
     time_cols: list[str],
-    stage2_start: float = 16.0,
-) -> tuple[bool, float]:
+    cfg: Stage2ConfigEvidence,
+) -> EvidenceScores:
     """
-    Determine late-horizon availability strictly from raw wide time headers.
-    This intentionally ignores any early-pass truncation/resampling so Stage-2
-    cannot be accidentally disabled when the experiment extends past 16h.
+    Computes evidence scores from a single canonical-wide row.
+    Uses raw values; does not normalize/smooth/interpolate.
     """
-    times = np.array([parse_time_from_header(str(c)) for c in time_cols], dtype=float)
-    times = times[np.isfinite(times)]
-    if times.size == 0:
-        return False, float(np.nan)
-    raw_observed_tmax = float(np.nanmax(times))
-    return bool(raw_observed_tmax > float(stage2_start)), raw_observed_tmax
+    t_all = np.array([parse_time_from_header(str(c)) for c in time_cols], dtype=float)
+    y_all = pd.to_numeric(wide_row[time_cols], errors="coerce").to_numpy(dtype=float)
 
+    m = np.isfinite(t_all) & np.isfinite(y_all)
+    t_all, y_all = t_all[m], y_all[m]
 
-def get_time_cols(df: pd.DataFrame) -> list[str]:
-    return [c for c in df.columns if parse_time_from_header(str(c)) is not None]
-
-
-def compute_raw_tmax_and_has_late(
-    row: pd.Series,
-    time_cols: list[str],
-    stage2_start: float = 16.0,
-) -> tuple[float, bool]:
-    has_late_data, raw_tmax = compute_has_late_data_from_raw(row, time_cols, stage2_start=stage2_start)
-    return raw_tmax, has_late_data
-
-
-def compute_late_features(wide_row: pd.Series, time_cols: list[str], cfg: Stage2Config) -> dict[str, object]:
-    out: dict[str, object] = {
-        "has_late_data": False,
-        "late_window_start": float(cfg.stage2_start),
-        "late_tmax": np.nan,
-        "late_n_points": 0,
-        "late_slope": np.nan,
-        "late_delta": np.nan,
-        "late_max_increase": np.nan,
-        "late_growth_detected": False,
-        "plateau_detected": False,
-        "decline_detected": False,
-        "drift_detected": False,
-        "noise_detected": False,
-        "sigma_noise": np.nan,
-        "late_linearity_r2": np.nan,
-        "raw_observed_tmax": np.nan,
-        "late_too_sparse": False,
-        # Internal context used by decision policy.
-        "_artifact_strong": False,
-        "_early_weak": False,
-        "_evaporation_artifact": False,
-    }
-    if not time_cols:
-        return out
-
-    has_late_data_raw, raw_observed_tmax = compute_has_late_data_from_raw(
-        wide_row, time_cols, stage2_start=cfg.stage2_start
-    )
-    times_raw = np.array([parse_time_from_header(str(c)) for c in time_cols], dtype=float)
-    vals_raw = pd.to_numeric(wide_row[time_cols], errors="coerce").to_numpy(dtype=float)
-    n_late_raw = int(np.sum(np.isfinite(times_raw) & (times_raw > float(cfg.stage2_start)) & np.isfinite(vals_raw)))
-    out["raw_observed_tmax"] = raw_observed_tmax
-    if has_late_data_raw:
-        out["has_late_data"] = True
-        out["late_tmax"] = raw_observed_tmax
-        out["late_n_points"] = n_late_raw
-        out["late_window_start"] = float(cfg.stage2_start)
-    else:
-        out["late_n_points"] = 0
-
-    t, y = _extract_curve_arrays(wide_row, time_cols)
-    if t.size < 2:
-        return out
-
-    early = t <= float(cfg.stage2_start)
-    late = t > float(cfg.stage2_start)
-
-    if np.any(early):
-        y_early = y[early]
-        t_early = t[early]
-        early_max = float(np.nanmax(y_early))
-        early_min = float(np.nanmin(y_early))
-        early_last = float(y_early[-1])
-    else:
-        y_early = np.array([], dtype=float)
-        t_early = np.array([], dtype=float)
-        early_max = float(np.nanmax(y))
-        early_min = float(np.nanmin(y))
-        early_last = float(y[0])
-
-    overall_peak = float(np.nanmax(y))
-    peak_idx = int(np.nanargmax(y))
-    peak_time = float(t[peak_idx])
-    early_amp = float(early_max - early_min) if np.isfinite(early_max) and np.isfinite(early_min) else np.nan
-    out["_early_weak"] = bool(np.isfinite(early_amp) and early_amp < cfg.growth_min_amplitude)
-
-    if not has_late_data_raw:
-        return out
-
-    t_late = t[late]
-    y_late = y[late]
-
-    if n_late_raw < int(cfg.late_min_points) or t_late.size < 2:
-        # Stage-2 unreliable: keep feature values as NaN/False.
-        out["late_too_sparse"] = True
-        return out
-
-    sigma_noise = 0.0
-    baseline_pool = y_early if y_early.size else y
-    n_base = int(min(5, baseline_pool.size))
-    if n_base >= 3:
-        sigma_noise = float(np.nanstd(baseline_pool[:n_base]))
-    out["sigma_noise"] = float(sigma_noise)
-
-    dt_early = np.diff(t_early) if t_early.size >= 2 else np.array([], dtype=float)
-    dt_early = dt_early[np.isfinite(dt_early) & (dt_early > 1e-12)]
-    delta_time = float(np.nanmedian(dt_early)) if dt_early.size else 1.0
-    dynamic_abs_threshold = max(float(cfg.abs_threshold), 3.0 * float(sigma_noise))
-    dynamic_slope_threshold = max(float(cfg.slope_threshold), 3.0 * float(sigma_noise) / max(delta_time, 1e-12))
-
-    y_lw = _winsorize(y_late)
-    out["late_slope"] = _robust_slope(t_late, y_lw)
-    out["late_delta"] = float(y_lw[-1] - y_lw[0]) if y_lw.size else np.nan
-    out["late_max_increase"] = float(np.nanmax(y_lw) - np.nanmin(y_lw)) if y_lw.size else np.nan
-
-    diffs = np.diff(y_lw)
-    growth_min_delta = max(dynamic_abs_threshold, float(cfg.rel_threshold) * max(1e-6, early_max))
-    sustained = _sustained_positive(diffs, float(cfg.diff_threshold))
-    out["late_growth_detected"] = bool(
-        np.isfinite(out["late_delta"])
-        and np.isfinite(out["late_slope"])
-        and (float(out["late_delta"]) >= growth_min_delta)
-        and (float(out["late_slope"]) >= dynamic_slope_threshold)
-        and sustained
-    )
-    if out["late_growth_detected"]:
-        r2_linear = np.nan
-        quad_term = np.nan
-        try:
-            lin_coef = np.polyfit(t_late, y_lw, 1)
-            y_lin = np.polyval(lin_coef, t_late)
-            ss_res_lin = float(np.sum((y_lw - y_lin) ** 2))
-            ss_tot = float(np.sum((y_lw - np.mean(y_lw)) ** 2))
-            r2_linear = 1.0 - (ss_res_lin / max(ss_tot, 1e-12))
-        except Exception:
-            r2_linear = np.nan
-        try:
-            quad_coef = np.polyfit(t_late, y_lw, 2)
-            quad_term = float(quad_coef[0])
-        except Exception:
-            quad_term = np.nan
-        out["late_linearity_r2"] = float(r2_linear) if np.isfinite(r2_linear) else np.nan
-        out["_evaporation_artifact"] = bool(
-            np.isfinite(r2_linear)
-            and (float(r2_linear) > float(cfg.evaporation_r2_threshold))
-            and np.isfinite(quad_term)
-            and (abs(float(quad_term)) < float(cfg.evaporation_quadratic_term_threshold))
+    if t_all.size < cfg.min_late_points:
+        return EvidenceScores(
+            growth_z_like=0.0,
+            artifact_score=0.5,
+            data_quality=0.0,
+            confidence=0.0,
+            n_late_points=0,
         )
 
-    # Plateau corroboration: near-flat late slope and last values close to late max,
-    # only meaningful when prior rise amplitude exists.
-    late_max = float(np.nanmax(y_lw))
-    tail_n = int(max(3, min(5, y_lw.size)))
-    tail_median = float(np.nanmedian(y_lw[-tail_n:]))
-    growth_before = bool((overall_peak - early_min) >= float(cfg.growth_min_amplitude))
-    out["plateau_detected"] = bool(
-        growth_before
-        and np.isfinite(out["late_slope"])
-        and (abs(float(out["late_slope"])) <= float(cfg.plateau_slope_eps))
-        and ((late_max - tail_median) <= float(cfg.plateau_band))
+    # Sort
+    idx = np.argsort(t_all)
+    t_all, y_all = t_all[idx], y_all[idx]
+
+    early_mask = t_all <= float(cfg.stage2_start)
+    late_mask = t_all > float(cfg.stage2_start)
+
+    y_early = y_all[early_mask]
+    t_late = t_all[late_mask]
+    y_late = y_all[late_mask]
+
+    n_late = int(np.isfinite(y_late).sum())
+    if n_late < cfg.min_late_points or t_late.size < cfg.min_late_points:
+        return EvidenceScores(
+            growth_z_like=0.0,
+            artifact_score=0.5,
+            data_quality=0.0,
+            confidence=0.0,
+            n_late_points=n_late,
+        )
+
+    # Compute components
+    noise_level = compute_noise_baseline_from_diffs(y_early, y_late, cfg)
+    z_like, slope, delta = compute_growth_evidence_z_like(t_late, y_late, noise_level, cfg)
+    artifact_score = compute_artifact_score(t_late, y_late, noise_level, cfg)
+    data_quality = compute_data_quality(t_late, y_late, cfg)
+
+    span = float(np.nanmax(t_late) - np.nanmin(t_late)) if t_late.size > 0 else np.nan
+
+    # Confidence: simple and honest mapping (quality * evidence strength)
+    # Normalize z-like (2.0 ≈ threshold) => evidence_strength in [0,1]
+    evidence_strength = _bounded(z_like / 4.0, 0.0, 1.0)
+    # Penalize if artifact is high
+    artifact_penalty = 1.0 - _bounded(artifact_score, 0.0, 1.0)
+    confidence = float(data_quality * evidence_strength * artifact_penalty)
+    confidence = _bounded(confidence, 0.0, 1.0)
+
+    return EvidenceScores(
+        growth_z_like=float(z_like),
+        artifact_score=float(artifact_score),
+        data_quality=float(data_quality),
+        confidence=float(confidence),
+        late_slope=float(slope) if np.isfinite(slope) else np.nan,
+        late_delta=float(delta) if np.isfinite(delta) else np.nan,
+        noise_level=float(noise_level) if np.isfinite(noise_level) else np.nan,
+        n_late_points=int(n_late),
+        late_span_hours=float(span) if np.isfinite(span) else np.nan,
     )
 
-    # Decline corroboration: peak not at very end + sustained negative late slope + peak-to-last drop.
-    last_span = float(np.nanmax(t_late) - peak_time)
-    last_w = int(max(3, min(6, y_lw.size)))
-    slope_last = _robust_slope(t_late[-last_w:], y_lw[-last_w:])
-    drop_peak_to_last = float(overall_peak - y_lw[-1])
-    out["decline_detected"] = bool(
-        (last_span >= float(cfg.min_decline_span))
-        and np.isfinite(slope_last)
-        and (float(slope_last) <= -float(cfg.decline_slope_threshold))
-        and (drop_peak_to_last >= float(cfg.decline_drop_threshold))
-    )
 
-    rough = _roughness(y_lw)
-    mono_frac = _monotonicity_fraction(diffs, float(cfg.diff_threshold))
-    sign_changes = _sign_changes(diffs, float(cfg.diff_threshold))
-    max_abs_diff = float(np.nanmax(np.abs(diffs))) if diffs.size else 0.0
-    directionality = float(max(np.mean(diffs > 0), np.mean(diffs < 0))) if diffs.size else 1.0
+# ----------------------------
+# Tweak 4: Checker-only decision
+# ----------------------------
+def compute_stage2_checker_status(
+    stage1_label: str,
+    stage1_confidence: float,
+    evidence: EvidenceScores,
+    cfg: Stage2ConfigEvidence,
+) -> tuple[str, str, dict[str, Any]]:
+    """
+    Returns:
+      status: one of {"Corroborated", "Contradiction", "Insufficient"}
+      reason: string code
+      evidence_dict: scalar evidence payload for audit/debug
 
-    out["drift_detected"] = bool(
-        np.isfinite(out["late_max_increase"])
-        and (float(out["late_max_increase"]) <= float(cfg.drift_amplitude_max))
-        and np.isfinite(mono_frac)
-        and (mono_frac >= float(cfg.drift_monotonicity_min))
-        and np.isfinite(rough)
-        and (rough <= float(cfg.drift_roughness_max))
-        and not out["late_growth_detected"]
-    )
+    This does NOT output Valid/Invalid. Stage-2 is a checker only.
+    """
 
-    out["noise_detected"] = bool(
-        (np.isfinite(rough) and rough >= float(cfg.noise_roughness_min))
-        or (sign_changes >= int(cfg.noise_signchange_min))
-        or (max_abs_diff >= float(cfg.spike_threshold) and directionality < 0.7)
-    )
+    s1 = str(stage1_label or "").strip()
+    s1c = _safe_float(stage1_confidence, default=np.nan)
 
-    out["_artifact_strong"] = bool(
-        (out["drift_detected"] and np.isfinite(out["late_max_increase"]) and float(out["late_max_increase"]) <= float(cfg.drift_amplitude_max) * 0.75)
-        or (out["noise_detected"] and sign_changes >= int(cfg.noise_signchange_min) + 2)
-    )
-    return out
+    ed = {
+        "growth_z_like": float(evidence.growth_z_like),
+        "artifact_score": float(evidence.artifact_score),
+        "data_quality": float(evidence.data_quality),
+        "decision_confidence": float(evidence.confidence),
+        "late_slope": float(evidence.late_slope) if np.isfinite(evidence.late_slope) else np.nan,
+        "late_delta": float(evidence.late_delta) if np.isfinite(evidence.late_delta) else np.nan,
+        "noise_level": float(evidence.noise_level) if np.isfinite(evidence.noise_level) else np.nan,
+        "late_n_points": int(evidence.n_late_points),
+        "late_span_hours": float(evidence.late_span_hours) if np.isfinite(evidence.late_span_hours) else np.nan,
+    }
 
+    # 1) Quality gate
+    if float(evidence.data_quality) < float(cfg.quality_threshold):
+        return "Insufficient", "S2_INSUFFICIENT_DATA_QUALITY", ed
 
-def compute_stage2_decision(
-    stage1_label: object,
-    stage1_conf: float | int | None,
-    late_features: Mapping[str, object],
-    cfg: Stage2Config,
-) -> tuple[str, str]:
-    s1 = _normalize_label(stage1_label)
-    s1_conf_num = pd.to_numeric(pd.Series([stage1_conf]), errors="coerce").iloc[0]
-    s1_conf_val = float(s1_conf_num) if np.isfinite(s1_conf_num) else np.nan
+    # 2) Evidence flags
+    strong_growth = float(evidence.growth_z_like) >= float(cfg.growth_z_threshold)
+    strong_artifact = float(evidence.artifact_score) >= float(cfg.artifact_score_threshold)
 
-    has_late = bool(late_features.get("has_late_data", False))
-    n_late = pd.to_numeric(pd.Series([late_features.get("late_n_points", np.nan)]), errors="coerce").iloc[0]
-    late_too_sparse = bool(late_features.get("late_too_sparse", False))
-    if (not has_late) or (not np.isfinite(n_late)) or int(n_late) < int(cfg.late_min_points):
-        if has_late:
-            return "Unsure", S2_REASON_TOO_SPARSE_LATE
-        return "", ""
-    if late_too_sparse:
-        return "Unsure", S2_REASON_TOO_SPARSE_LATE
-
-    late_growth = bool(late_features.get("late_growth_detected", False))
-    evaporation_artifact = bool(late_features.get("_evaporation_artifact", False))
-    plateau = bool(late_features.get("plateau_detected", False))
-    decline = bool(late_features.get("decline_detected", False))
-    drift = bool(late_features.get("drift_detected", False))
-    noise = bool(late_features.get("noise_detected", False))
-    early_weak = bool(late_features.get("_early_weak", False))
-    artifact_strong = bool(late_features.get("_artifact_strong", False))
-
-    if late_growth and evaporation_artifact:
-        return "Invalid", S2_REASON_ARTIFACT_EVAPORATION
-
+    # 3) Checker logic
+    # If Stage-1 says Invalid, late growth without artifact is a contradiction (delayed growth scenario)
     if s1 == "Invalid":
-        if late_growth:
-            return "Unsure", S2_REASON_LATE_GROWTH
-        if drift or noise:
-            if artifact_strong and early_weak:
-                return "Invalid", S2_REASON_DRIFT_NOISE
-            return "Unsure", S2_REASON_ARTIFACT
-        return "Invalid", S2_REASON_NO_SUPPORT
+        if strong_growth and (not strong_artifact):
+            return "Contradiction", "S2_CONTRADICTORY_LATE_GROWTH", ed
+        return "Corroborated", "S2_CORROBORATES_INVALID", ed
 
+    # If Stage-1 says Valid, strong artifact is a contradiction (Stage-1 likely overly confident)
     if s1 == "Valid":
-        if plateau or decline:
-            return "Valid", S2_REASON_CORROBORATION
-        if drift or noise:
-            return "Unsure", S2_REASON_ARTIFACT
-        return "Valid", S2_REASON_NO_CHANGE
+        if strong_artifact:
+            return "Contradiction", "S2_ARTIFACT_DETECTED", ed
+        # Whether growth continues or plateaus, Stage-2 corroborates validity
+        if strong_growth:
+            return "Corroborated", "S2_CONTINUED_GROWTH", ed
+        return "Corroborated", "S2_STABLE_OR_PLATEAU", ed
 
-    # Stage-1 unsure/unknown fallback.
-    if late_growth and (plateau or decline):
-        return "Valid", S2_REASON_CORROBORATION
-    if drift or noise:
-        return "Unsure", S2_REASON_ARTIFACT
-    return "Unsure", S2_REASON_NO_CHANGE
+    # Unknown Stage-1 label
+    return "Insufficient", "S2_STAGE1_MISSING_OR_UNKNOWN", ed
 
 
-def compute_stage2_label(
-    stage1_label: object,
-    stage1_conf: float | int | None,
-    late_features: Mapping[str, object],
-    cfg: Stage2Config,
-) -> tuple[str, str]:
-    return compute_stage2_decision(stage1_label, stage1_conf, late_features, cfg)
+# ============================================================
+# Optional: Legacy-ish wrapper (scalar-only outputs)
+#   You said you'll handle integration later; this wrapper can
+#   help you keep a similar "late features" table shape.
+# ============================================================
+def compute_late_features(
+    wide_row: pd.Series,
+    time_cols: list[str],
+    cfg: Stage2ConfigEvidence | None = None,
+) -> dict[str, object]:
+    """
+    Scalar-only late features output (safe for CSV/UI).
+    """
+    if cfg is None:
+        cfg = Stage2ConfigEvidence()
 
+    ev = compute_evidence_scores(wide_row, time_cols, cfg)
 
-def compose_final_label(
-    stage1_label: object,
-    stage1_conf: float | int | None,
-    stage2_label: object,
-    stage2_reason: object,
-    cfg: Stage2Config,
-) -> str:
-    s1 = _normalize_label(stage1_label)
-    s2 = _normalize_label(stage2_label)
-    reason = str(stage2_reason).strip() if stage2_reason is not None else ""
-    s1_conf_num = pd.to_numeric(pd.Series([stage1_conf]), errors="coerce").iloc[0]
-    s1_conf_val = float(s1_conf_num) if np.isfinite(s1_conf_num) else np.nan
+    has_late = int(ev.n_late_points) >= int(cfg.min_late_points)
+    out: dict[str, object] = {
+        "has_late_data": bool(has_late),
+        "late_n_points": int(ev.n_late_points),
+        "late_span_hours": float(ev.late_span_hours) if np.isfinite(ev.late_span_hours) else np.nan,
 
-    if s2 == "":
-        return s1 if s1 else "Unsure"
-    if s2 == "Valid":
-        return "Valid"
-    if s2 == "Unsure":
-        if s1 == "Valid":
-            if np.isfinite(s1_conf_val) and s1_conf_val >= float(cfg.conf_downgrade_threshold):
-                return "Valid"
-        return "Unsure"
-    if s2 == "Invalid":
-        if s1 == "Invalid":
-            return "Invalid"
-        if s1 == "Valid":
-            strong_artifact = reason == S2_REASON_DRIFT_NOISE
-            if strong_artifact and np.isfinite(s1_conf_val) and s1_conf_val < float(cfg.conf_downgrade_threshold):
-                return "Invalid"
-            if np.isfinite(s1_conf_val) and s1_conf_val < float(cfg.conf_downgrade_threshold):
-                return "Unsure"
-            return "Valid"
-        return "Invalid"
-    return s1 if s1 else "Unsure"
+        # Core evidence (thesis-friendly)
+        "growth_z_like": float(ev.growth_z_like),
+        "artifact_score": float(ev.artifact_score),
+        "data_quality": float(ev.data_quality),
+        "decision_confidence": float(ev.confidence),
+
+        # Supporting metrics
+        "late_slope": float(ev.late_slope) if np.isfinite(ev.late_slope) else np.nan,
+        "late_delta": float(ev.late_delta) if np.isfinite(ev.late_delta) else np.nan,
+        "noise_level": float(ev.noise_level) if np.isfinite(ev.noise_level) else np.nan,
+
+        # Thresholded flags (useful but still defensible)
+        "late_growth_detected": bool(ev.growth_z_like >= cfg.growth_z_threshold),
+        "artifact_detected": bool(ev.artifact_score >= cfg.artifact_score_threshold),
+        "late_window_start": float(cfg.stage2_start),
+    }
+    return out

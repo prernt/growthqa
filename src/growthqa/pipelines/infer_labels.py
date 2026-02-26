@@ -5,24 +5,28 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import importlib
 import joblib
 import numpy as np
 import pandas as pd
 import platform
 import sklearn
-import importlib
+
 from growthqa.pipelines.build_meta_dataset import run_merge_preprocess_meta
 from growthqa.preprocess.timegrid import parse_time_from_header
+
+# NEW Stage-2 (evidence-based)
 from growthqa.stage2.late_window import (
-    Stage2Config,
-    compose_final_label,
-    compute_has_late_data_from_raw,
-    compute_late_features,
-    get_time_cols,
-    compute_stage2_label,
+    Stage2ConfigEvidence,
+    EvidenceScores,
+    compute_evidence_scores,
+    compute_stage2_checker_status,
 )
 
 
+# ============================================================
+# Model loading utilities (unchanged from your zip)
+# ============================================================
 def assert_runtime_matches_model(model_path: str) -> None:
     mp = Path(model_path)
     manifest = mp.with_suffix(".manifest.json")
@@ -47,13 +51,6 @@ def assert_runtime_matches_model(model_path: str) -> None:
             file=sys.stderr,
         )
 
-
-def load_model_pipeline(model_path: str):
-    _install_legacy_sklearn_pickle_aliases()
-    assert_runtime_matches_model(model_path)
-    return joblib.load(model_path)
-
-
 def _install_legacy_sklearn_pickle_aliases() -> None:
     """
     Backward-compatibility shim for old sklearn pickles.
@@ -69,6 +66,12 @@ def _install_legacy_sklearn_pickle_aliases() -> None:
     except Exception:
         return
     sys.modules[legacy_mod] = new_mod
+
+
+def load_model_pipeline(model_path: str):
+    _install_legacy_sklearn_pickle_aliases()
+    assert_runtime_matches_model(model_path)
+    return joblib.load(model_path)
 
 
 def discover_models(model_dir: str | Path) -> dict[str, Path]:
@@ -164,11 +167,18 @@ def _safe_get_setting(settings: Any, key: str, default: Any) -> Any:
     return getattr(settings, key, default)
 
 
+# ============================================================
+# Curve key helpers (kept from your zip)
+# ============================================================
 def _extract_conc_from_curve_id(curve_id: str) -> float | None:
     if curve_id is None:
         return None
     s = str(curve_id)
-    m = __import__("re").search(r"\[(?:\s*Conc\s*=\s*)?([0-9]+(?:\.[0-9]+)?)\s*\]", s, flags=__import__("re").IGNORECASE)
+    m = __import__("re").search(
+        r"\[(?:\s*Conc\s*=\s*)?([0-9]+(?:\.[0-9]+)?)\s*\]",
+        s,
+        flags=__import__("re").IGNORECASE,
+    )
     if not m:
         return None
     try:
@@ -195,13 +205,16 @@ def _fmt_conc_for_key(v: object) -> str:
         return ""
     return f"{float(n):g}"
 
+
 def _test_id_encodes_conc(test_id: object) -> bool:
     if test_id is None:
         return False
     s = str(test_id)
-    # Matches: [0.1] or [Conc=0.1] etc.
-    return __import__("re").search(r"\[(?:\s*Conc\s*=\s*)?([0-9]+(?:\.[0-9]+)?)\s*\]", s, flags=__import__("re").IGNORECASE) is not None
-
+    return __import__("re").search(
+        r"\[(?:\s*Conc\s*=\s*)?([0-9]+(?:\.[0-9]+)?)\s*\]",
+        s,
+        flags=__import__("re").IGNORECASE,
+    ) is not None
 
 
 def _attach_curve_key(df: pd.DataFrame) -> pd.DataFrame:
@@ -210,7 +223,6 @@ def _attach_curve_key(df: pd.DataFrame) -> pd.DataFrame:
         return out
     out["Test Id"] = out["Test Id"].astype(str)
 
-    # If Test Id already encodes concentration (e.g. "...[0.1]"), NEVER append "||conc"
     enc = out["Test Id"].map(_test_id_encodes_conc)
 
     if "Concentration" in out.columns:
@@ -227,20 +239,9 @@ def _attach_curve_key(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _split_wide_raw_by_time(
-    wide_raw_df: pd.DataFrame,
-    *,
-    stage2_start: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    time_cols = [c for c in wide_raw_df.columns if parse_time_from_header(str(c)) is not None]
-    non_time_cols = [c for c in wide_raw_df.columns if c not in time_cols]
-    early_cols = [c for c in time_cols if float(parse_time_from_header(str(c))) <= float(stage2_start)]
-    late_cols = [c for c in time_cols if float(parse_time_from_header(str(c))) > float(stage2_start)]
-    wide_early_raw_df = wide_raw_df[non_time_cols + early_cols].copy()
-    wide_late_raw_df = wide_raw_df[non_time_cols + late_cols].copy()
-    return wide_early_raw_df, wide_late_raw_df
-
-
+# ============================================================
+# Wide -> tidy grofit (unchanged from your zip)
+# ============================================================
 def wide_original_to_grofit_tidy(
     wide_original: pd.DataFrame,
     *,
@@ -271,138 +272,127 @@ def wide_original_to_grofit_tidy(
     return tidy[["test_id", "curve_id", "concentration", "time", "y"]]
 
 
-def _compute_stage2_features_from_wide(
+# ============================================================
+# NEW Stage-2 evidence feature computation from wide
+# ============================================================
+def _get_time_cols(wide_df: pd.DataFrame) -> list[str]:
+    cols = [c for c in wide_df.columns if parse_time_from_header(str(c)) is not None]
+    return sorted(cols, key=lambda c: float(parse_time_from_header(str(c))))
+
+
+def _compute_stage2_features_from_wide_evidence(
     wide_raw_df: pd.DataFrame,
-    wide_late_df: pd.DataFrame,
     *,
-    cfg: Stage2Config,
+    cfg: Stage2ConfigEvidence,
 ) -> pd.DataFrame:
-    raw_time_cols = get_time_cols(wide_raw_df)
-    late_time_cols = get_time_cols(wide_late_df)
-    raw_times = np.array([parse_time_from_header(str(c)) for c in raw_time_cols], dtype=float)
-    late_header_mask = np.isfinite(raw_times) & (raw_times > float(cfg.stage2_start))
-    late_raw_cols = [c for c, keep in zip(raw_time_cols, late_header_mask) if keep]
+    """
+    Computes Stage-2 evidence scores PER CURVE using full-horizon raw wide table.
+
+    Returns scalar-only columns (CSV/UI friendly).
+    """
+    time_cols = _get_time_cols(wide_raw_df)
     rows: list[dict[str, object]] = []
-    for idx, row_raw in wide_raw_df.iterrows():
-        row_late = wide_late_df.loc[idx]
-        tid = str(row_raw.get("Test Id"))
+
+    for _, row_raw in wide_raw_df.iterrows():
+        tid = str(row_raw.get("Test Id", ""))
         conc = pd.to_numeric(pd.Series([row_raw.get("Concentration", np.nan)]), errors="coerce").iloc[0]
-        has_late_raw, raw_observed_tmax = compute_has_late_data_from_raw(
-            row_raw,
-            raw_time_cols,
-            stage2_start=cfg.stage2_start,
-        )
-        if late_raw_cols:
-            y_late_raw = pd.to_numeric(row_raw[late_raw_cols], errors="coerce").to_numpy(dtype=float)
-            n_late_raw = int(np.sum(np.isfinite(y_late_raw)))
-        else:
-            n_late_raw = 0
-        f = compute_late_features(row_late, late_time_cols, cfg) if has_late_raw else {}
-        late_tmax = raw_observed_tmax if has_late_raw else np.nan
-        late_n_points = n_late_raw if has_late_raw else 0
-        late_too_sparse = bool(has_late_raw and late_n_points < int(cfg.late_min_points))
+        curve_key = row_raw.get("curve_key", tid)
+
+        ev = compute_evidence_scores(row_raw, time_cols, cfg)
+
+        has_late = bool(ev.n_late_points >= cfg.min_late_points)
+
         rows.append(
             {
                 "Test Id": tid,
                 "Concentration": conc,
-                "curve_key": row_raw.get("curve_key", tid),
-                "has_late_data": bool(has_late_raw),
-                "raw_observed_tmax": raw_observed_tmax,
-                "late_window_start": float(cfg.stage2_start) if has_late_raw else np.nan,
-                "late_tmax": late_tmax,
-                "late_n_points": late_n_points,
-                "late_slope": f.get("late_slope", np.nan),
-                "late_delta": f.get("late_delta", np.nan),
-                "late_max_increase": f.get("late_max_increase", np.nan),
-                "late_growth_detected": f.get("late_growth_detected", False),
-                "plateau_detected": f.get("plateau_detected", False),
-                "decline_detected": f.get("decline_detected", False),
-                "drift_detected": f.get("drift_detected", False),
-                "noise_detected": f.get("noise_detected", False),
-                "sigma_noise": f.get("sigma_noise", np.nan),
-                "late_linearity_r2": f.get("late_linearity_r2", np.nan),
-                "late_too_sparse": bool(f.get("late_too_sparse", False) or late_too_sparse),
-                "_artifact_strong": f.get("_artifact_strong", False),
-                "_early_weak": f.get("_early_weak", False),
+                "curve_key": curve_key,
+                "has_late_data": has_late,
+                "late_window_start": float(cfg.stage2_start),
+                "late_n_points": int(ev.n_late_points),
+                "late_span_hours": float(ev.late_span_hours) if np.isfinite(ev.late_span_hours) else np.nan,
+                # Core evidence
+                "growth_z_like": float(ev.growth_z_like),
+                "artifact_score": float(ev.artifact_score),
+                "data_quality": float(ev.data_quality),
+                "decision_confidence": float(ev.confidence),
+                # Supporting
+                "late_slope": float(ev.late_slope) if np.isfinite(ev.late_slope) else np.nan,
+                "late_delta": float(ev.late_delta) if np.isfinite(ev.late_delta) else np.nan,
+                "noise_level": float(ev.noise_level) if np.isfinite(ev.noise_level) else np.nan,
+                # Flags (thresholded)
+                "late_growth_detected": bool(ev.growth_z_like >= cfg.growth_z_threshold),
+                "artifact_detected": bool(ev.artifact_score >= cfg.artifact_score_threshold),
             }
         )
+
     return pd.DataFrame(rows)
 
 
-def _assign_final_reason_labels(
+def _assign_stage2_checker_outputs(
     out_df: pd.DataFrame,
     *,
-    cfg: Stage2Config,
+    cfg: Stage2ConfigEvidence,
 ) -> pd.DataFrame:
-    # stage2_labels: list[str] = []
-    # final_labels: list[str] = []
-    # reasons: list[str] = []
-    stage2_labels: list[str] = []
-    final_labels: list[str] = []
-    reasons: list[str] = []
+    """
+    Uses the evidence columns already merged into out_df to compute:
 
+      - Stage 2 Label  (checker status: Corroborated / Contradiction / Insufficient)
+      - Label Reason
+      - Pred Label (final conservative label: contradiction -> Unsure, else keep Stage-1)
+
+    This gives you a thesis-defensible behavior immediately.
+    """
+    stage2_labels: list[str] = []
+    reasons: list[str] = []
+    final_labels: list[str] = []
 
     for _, row in out_df.iterrows():
-        s1_label = _normalize_label_text(row.get("pred_label", ""))
+        s1 = _normalize_label_text(row.get("pred_label", ""))
         s1_conf = pd.to_numeric(pd.Series([row.get("pred_confidence", np.nan)]), errors="coerce").iloc[0]
-        stage2_label, label_reason = compute_stage2_label(
-            stage1_label=s1_label,
-            stage1_conf=s1_conf,
-            late_features=row.to_dict(),
+
+        ev = EvidenceScores(
+            growth_z_like=float(pd.to_numeric(pd.Series([row.get("growth_z_like", 0.0)]), errors="coerce").iloc[0]),
+            artifact_score=float(pd.to_numeric(pd.Series([row.get("artifact_score", 0.5)]), errors="coerce").iloc[0]),
+            data_quality=float(pd.to_numeric(pd.Series([row.get("data_quality", 0.0)]), errors="coerce").iloc[0]),
+            confidence=float(pd.to_numeric(pd.Series([row.get("decision_confidence", 0.0)]), errors="coerce").iloc[0]),
+            late_slope=float(pd.to_numeric(pd.Series([row.get("late_slope", np.nan)]), errors="coerce").iloc[0]),
+            late_delta=float(pd.to_numeric(pd.Series([row.get("late_delta", np.nan)]), errors="coerce").iloc[0]),
+            noise_level=float(pd.to_numeric(pd.Series([row.get("noise_level", np.nan)]), errors="coerce").iloc[0]),
+            n_late_points=int(pd.to_numeric(pd.Series([row.get("late_n_points", 0)]), errors="coerce").iloc[0]),
+            late_span_hours=float(pd.to_numeric(pd.Series([row.get("late_span_hours", np.nan)]), errors="coerce").iloc[0]),
+        )
+
+        status, reason, _ = compute_stage2_checker_status(
+            stage1_label=s1,
+            stage1_confidence=float(s1_conf) if np.isfinite(s1_conf) else np.nan,
+            evidence=ev,
             cfg=cfg,
         )
-        stage2_labels.append(stage2_label if stage2_label else np.nan)
-        reasons.append(label_reason if label_reason else np.nan)
-        final_labels.append(
-            compose_final_label(
-                stage1_label=s1_label,
-                stage1_conf=s1_conf,
-                stage2_label=stage2_label,
-                stage2_reason=label_reason,
-                cfg=cfg,
-            )
-        )
+
+        stage2_labels.append(status)
+        reasons.append(reason)
+
+        # Conservative final decision (thesis-friendly):
+        # any contradiction -> Unsure, else preserve Stage-1
+        if status == "Contradiction":
+            final_labels.append("Unsure")
+        elif status == "Insufficient":
+            final_labels.append(s1 if s1 else "Unsure")
+        else:
+            final_labels.append(s1 if s1 else "Unsure")
 
     out = out_df.copy()
-    # out["Predicted S1 Label"] = out.get("Predicted S1 Label", out.get("pred_label", "")).astype(str)
-    # out["Stage 2 Label"] = stage2_labels
-    # out["Label Reason"] = reasons
-    # out["Pred Label"] = final_labels
-    # out["Pred Confidence"] = pd.to_numeric(out.get("pred_confidence"), errors="coerce")
-    # # Backward compatibility for older consumers.
-    # out["final_label"] = final_labels
-    # out["final_reason"] = reasons
-    out["s1_label"] = out.get("pred_label", "").astype(str)
-    out["s1_confidence_valid"] = pd.to_numeric(out.get("confidence_valid", np.nan), errors="coerce")
-    out["stage2_label"] = stage2_labels
-    out["stage2_reason"] = reasons
-    out["final_label"] = final_labels
-
+    out["Stage 2 Label"] = stage2_labels
+    out["Label Reason"] = reasons
+    out["Pred Label"] = final_labels
+    out["final_label"] = final_labels  # keep the alias many places expect
     return out
 
 
-_STAGE2_FEATURE_COLS: list[str] = [
-    "has_late_data",
-    "raw_observed_tmax",
-    "late_window_start",
-    "late_tmax",
-    "late_n_points",
-    "late_slope",
-    "late_delta",
-    "late_max_increase",
-    "late_growth_detected",
-    "plateau_detected",
-    "decline_detected",
-    "drift_detected",
-    "noise_detected",
-    "sigma_noise",
-    "late_linearity_r2",
-    "late_too_sparse",
-    "_artifact_strong",
-    "_early_weak",
-]
-
-
+# ============================================================
+# Main inference function (Stage-1 same, Stage-2 replaced)
+# ============================================================
 def run_label_inference_from_uploaded_wide(
     wide_df: pd.DataFrame,
     settings: Any,
@@ -413,14 +403,20 @@ def run_label_inference_from_uploaded_wide(
 ) -> dict[str, pd.DataFrame]:
     if "Test Id" not in wide_df.columns:
         raise ValueError("Uploaded canonical wide data must include 'Test Id'.")
-    # Canonical full-horizon raw wide table. Stage-2 MUST read from this dataframe.
+
+    # full horizon (for Stage-2 evidence)
     wide_raw_df = _attach_curve_key(wide_df.copy())
-    wide_early_raw_df, wide_late_raw_df = _split_wide_raw_by_time(wide_raw_df, stage2_start=float(stage2_start))
+
+    # ---- Stage-1 pre-processing still runs on early window (your existing design) ----
+    # We keep your original approach: write early-window to temp CSV, run merge/preprocess/meta.
+    # Stage-2 ignores truncation and reads directly from wide_raw_df.
+    time_cols_all = [c for c in wide_raw_df.columns if parse_time_from_header(str(c)) is not None]
+    non_time_cols = [c for c in wide_raw_df.columns if c not in time_cols_all]
+    early_cols = [c for c in time_cols_all if float(parse_time_from_header(str(c))) <= float(stage2_start)]
+    wide_early_raw_df = wide_raw_df[non_time_cols + early_cols].copy()
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         tmp_wide_csv = Path(td) / "wide_input.csv"
-        # Stage-1 preprocessing/modeling still runs with tmax settings (typically 16h).
-        # This does NOT affect Stage-2, which reads directly from wide_raw_df.
         wide_early_raw_df.drop(columns=["curve_key"], errors="ignore").to_csv(tmp_wide_csv, index=False)
 
         blank_default = "RAW" if bool(_safe_get_setting(settings, "input_is_raw", False)) else "ALREADY"
@@ -446,8 +442,10 @@ def run_label_inference_from_uploaded_wide(
             loglevel="ERROR",
             augment_trunc=False,
         )
+
     meta_df = _attach_curve_key(meta_df)
 
+    # ---- Stage-1 model inference (unchanged) ----
     available_models = discover_models(model_dir)
     model_label_map: dict[str, Path] = {}
     for stem, p in available_models.items():
@@ -471,7 +469,16 @@ def run_label_inference_from_uploaded_wide(
             else:
                 valid_probs_list.append(_labels_to_prob_valid(plabel))
         valid_probs = np.vstack(valid_probs_list)
-        avg_valid = np.nanmean(valid_probs, axis=0)
+
+        eps = 1e-9
+        p_clipped = np.clip(valid_probs, eps, 1 - eps)
+        model_certainty = np.nanmean(np.abs(p_clipped - 0.5), axis=1)
+        if model_certainty.sum() > 0:
+            model_weights = model_certainty / model_certainty.sum()
+        else:
+            model_weights = np.ones(len(valid_probs_list)) / len(valid_probs_list)
+
+        avg_valid = np.nansum(valid_probs * model_weights[:, np.newaxis], axis=0)
         final_prob = np.where(np.isnan(avg_valid), 0.5, avg_valid)
         pred_label = np.where(final_prob >= 0.5, "Valid", "Invalid")
         pred_conf = np.maximum(final_prob, 1 - final_prob)
@@ -491,45 +498,45 @@ def run_label_inference_from_uploaded_wide(
         final_prob = p_valid if np.any(np.isfinite(p_valid)) else _labels_to_prob_valid(pred_label)
 
     out_df = _attach_curve_key(meta_df.copy())
+
     if "Concentration" not in out_df.columns and "Concentration" in wide_raw_df.columns:
         key_to_conc = dict(zip(wide_raw_df["curve_key"], pd.to_numeric(wide_raw_df["Concentration"], errors="coerce")))
         out_df["Concentration"] = out_df["curve_key"].map(key_to_conc)
         out_df = _attach_curve_key(out_df)
+
     out_df["pred_label"] = pred_label
     out_df["pred_confidence"] = np.round(pred_conf, 4)
     out_df["confidence_valid"] = np.round(final_prob, 4)
     out_df["confidence_invalid"] = np.round(1 - final_prob, 4)
     out_df["is_valid_pred"] = out_df["pred_label"].map(_label_is_valid).astype(bool)
+
     out_df["Predicted S1 Label"] = out_df["pred_label"].astype(str)
     out_df["S1 Confidence Valid"] = out_df["confidence_valid"]
-    # out_df["S1 Confidence Invalid"] = out_df["confidence_invalid"]
-    # Clarify that this tmax comes from Stage-1 early-pass preprocessing.
-    # if "observed_tmax" in out_df.columns:
-    #     out_df["early_observed_tmax"] = pd.to_numeric(out_df["observed_tmax"], errors="coerce")
-    # else:
-    #     out_df["early_observed_tmax"] = np.nan
 
-    # Stage-2 uses post-16h evidence from original wide data (never from truncated stage-1 tables).
-    stage2_cfg = Stage2Config(stage2_start=float(stage2_start))
-    stage2_df = _compute_stage2_features_from_wide(wide_raw_df, wide_late_raw_df, cfg=stage2_cfg)
-    # Remove early-pass late-feature columns from meta_df to avoid _x/_y suffix collisions.
-    out_df = out_df.drop(columns=[c for c in _STAGE2_FEATURE_COLS if c in out_df.columns], errors="ignore")
+    # ---- NEW Stage-2 evidence computation ----
+    stage2_cfg = Stage2ConfigEvidence(stage2_start=float(stage2_start))
+
+    stage2_df = _compute_stage2_features_from_wide_evidence(wide_raw_df, cfg=stage2_cfg)
+
     out_df = out_df.merge(
         stage2_df.drop(columns=["Test Id", "Concentration"], errors="ignore"),
         on=["curve_key"],
         how="left",
     )
-    out_df["late_min_points"] = int(stage2_cfg.late_min_points)
 
-    out_df = _assign_final_reason_labels(
-        out_df,
-        cfg=stage2_cfg,
-    )
-    # out_df["true_label"] = out_df["Pred Label"].astype(str)
-    # out_df["is_valid_true"] = out_df["true_label"].map(_label_is_valid).astype(bool)
-    # out_df["Reviewed"] = False
-    # # Backward compatibility with existing consumers.
-    # out_df["is_valid_final"] = out_df["is_valid_true"].astype(bool)
+    # Checker outputs + conservative final label
+    out_df = _assign_stage2_checker_outputs(out_df, cfg=stage2_cfg)
+
+    # Authoritative sparse override: sparse curves can never remain Valid.
+    too_sparse_mask = pd.to_numeric(out_df.get("too_sparse", False), errors="coerce").fillna(0).astype(int).eq(1)
+    if too_sparse_mask.any():
+        out_df.loc[too_sparse_mask, "final_label"] = "Unsure"
+        out_df.loc[too_sparse_mask, "Pred Label"] = "Unsure"
+        out_df.loc[too_sparse_mask, "pred_label"] = "Unsure"
+        out_df.loc[too_sparse_mask, "Label Reason"] = "TOO_SPARSE_OVERRIDE"
+
+    # UI/manual review init
+    out_df["Reviewed"] = False
     out_df["is_valid_final"] = out_df["final_label"].map(_label_is_valid).astype(bool)
 
     if "Is_Valid" in wide_df.columns:
@@ -539,6 +546,7 @@ def run_label_inference_from_uploaded_wide(
 
     file_tag = str(out_df["FileName"].iloc[0]) if "FileName" in out_df.columns and not out_df.empty else "uploaded"
     grofit_tidy_all = wide_original_to_grofit_tidy(wide_df, file_tag=file_tag)
+
     grofit_tidy_all["curve_key"] = grofit_tidy_all["curve_id"].astype(str)
     has_conc_g = pd.to_numeric(grofit_tidy_all["concentration"], errors="coerce").notna()
     grofit_tidy_all.loc[has_conc_g, "curve_key"] = (
@@ -546,12 +554,13 @@ def run_label_inference_from_uploaded_wide(
         + "||"
         + pd.to_numeric(grofit_tidy_all.loc[has_conc_g, "concentration"], errors="coerce").map(_fmt_conc_for_key)
     )
-    # pred_map_df = out_df[["curve_key", "is_valid_true", "pred_label", "final_label", "pred_confidence"]].drop_duplicates("curve_key")
-    pred_map_df = out_df[["curve_key", "is_valid_final", "pred_label", "final_label", "pred_confidence"]].drop_duplicates("curve_key")
 
+    pred_map_df = out_df[["curve_key", "is_valid_final", "pred_label", "final_label", "pred_confidence"]].drop_duplicates(
+        "curve_key"
+    )
     grofit_tidy_all = grofit_tidy_all.merge(pred_map_df, on="curve_key", how="left")
-    # grofit_tidy_all["is_valid_true"] = grofit_tidy_all["is_valid_true"].fillna(False).astype(bool)
     grofit_tidy_all["is_valid_final"] = grofit_tidy_all["is_valid_final"].fillna(False).astype(bool)
+
     return {
         "raw_merged_df": raw_merged_df,
         "final_merged_df": final_merged_df,

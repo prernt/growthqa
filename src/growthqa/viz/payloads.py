@@ -27,9 +27,10 @@ def _spline_payload(
     y: np.ndarray,
     *,
     spline_s: Optional[float],
+    smooth_gc: Optional[float],
     auto_cv: bool,
 ) -> dict:
-    fit = gc_fit_spline(t, y, lam=spline_s, auto_cv=auto_cv)
+    fit = gc_fit_spline(t, y, lam=spline_s, smooth=smooth_gc, auto_cv=auto_cv)
     if not fit.success:
         return {"ran": False}
     s_used = None
@@ -136,6 +137,7 @@ def build_curve_payloads(
     labels_df: pd.DataFrame,
     gc_boot: Optional[pd.DataFrame],
     spline_s: Optional[float],
+    smooth_gc: Optional[float],
     spline_auto_cv: bool,
     include_bootstrap: bool,
     test_id: Optional[str] = None,
@@ -174,7 +176,7 @@ def build_curve_payloads(
             labels["final"] = str(row.get("final_label", labels["pred"]))
             labels["reviewed"] = bool(row.get("Reviewed", False))
 
-        spline = _spline_payload(t_fit, y_fit, spline_s=spline_s, auto_cv=spline_auto_cv)
+        spline = _spline_payload(t_fit, y_fit, spline_s=spline_s, smooth_gc=smooth_gc, auto_cv=spline_auto_cv)
         label_for_model = labels["final"] or labels["pred"]
         parametric = _param_payload(t_fit, y_fit) if str(label_for_model).lower() in {"valid", "true", "1"} else {"ran": False}
         bootstrap = {"ran": False}
@@ -265,7 +267,9 @@ def build_dr_payload(
     include_unsure: bool,
     include_invalid: bool,
     dr_s: Optional[float],
+    smooth_dr: Optional[float],
     dr_x_transform: Optional[str],
+    dr_y_transform: Optional[str],
     show_bootstrap: bool,
 ) -> dict:
     metric_map = {
@@ -317,7 +321,15 @@ def build_dr_payload(
     x = df["concentration"].to_numpy(dtype=float)
     y = df["y"].to_numpy(dtype=float)
 
-    fit = dr_fit_spline(x, y, x_transform=dr_x_transform, lam=dr_s, auto_cv=(dr_s is None))
+    fit = dr_fit_spline(
+        x,
+        y,
+        x_transform=dr_x_transform,
+        y_transform=dr_y_transform,
+        lam=dr_s,
+        smooth=smooth_dr,
+        auto_cv=(dr_s is None and smooth_dr is None),
+    )
     x_grid_raw = fit.get("x_grid")
     method = fit.get("method")
     # 2. Logic to handle back-transformation only if necessary
@@ -387,17 +399,93 @@ def build_dr_payload(
         "excluded": excluded,
     }
 
-    if show_bootstrap and isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty:
-        boot_match = dr_boot
-        if test_id is not None and "name" in dr_boot.columns:
-            boot_match = boot_match[boot_match["name"].astype(str) == str(test_id)]
-        if not boot_match.empty:
-            brow = boot_match.iloc[0]
-            dr_payload["bootstrap"] = {
-                "ran": True,
-                "ec50_ci": [brow.get("ci95EC50.lo"), brow.get("ci95EC50.up")],
-                "n": brow.get("Samples") if "Samples" in brow else None,
-                "y_hat_q025": None,
-                "y_hat_q975": None,
-            }
+    if show_bootstrap:
+        brow = None
+        if isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty:
+            boot_match = dr_boot
+            if test_id is not None and "name" in dr_boot.columns:
+                matched = boot_match[boot_match["name"].astype(str) == str(test_id)]
+                # Fallback: if strict test_id match fails, keep full dr_boot
+                # so CI values are still available for single-test uploads.
+                if not matched.empty:
+                    boot_match = matched
+            if not boot_match.empty:
+                brow = boot_match.iloc[0]
+        # Compute a DR curve envelope for plotting (q2.5/q97.5 on y_hat)
+        # so the Bootstrap CI pill renders a visible band, not only EC50 CI.
+        y_hat_q025 = None
+        y_hat_q975 = None
+        try:
+            x_plot = np.asarray(dr_payload["fit"]["x_grid"], dtype=float)
+            if x_plot.size >= 4 and np.isfinite(x_plot).any():
+                rng = np.random.default_rng(42)
+                samples = brow.get("Samples", 120) if brow is not None else 120
+                B = int(pd.to_numeric(pd.Series([samples]), errors="coerce").iloc[0] or 120)
+                B = int(np.clip(B, 40, 250))
+                y_boots = []
+                for _ in range(B):
+                    idx = rng.integers(0, len(x), size=len(x))
+                    xb = x[idx]
+                    yb = y[idx]
+                    try:
+                        fb = dr_fit_spline(
+                            xb,
+                            yb,
+                            x_transform=dr_x_transform,
+                            y_transform=dr_y_transform,
+                            lam=dr_s,
+                            smooth=smooth_dr,
+                            auto_cv=(dr_s is None and smooth_dr is None),
+                        )
+                        xg_raw = fb.get("x_grid")
+                        yg = fb.get("y_hat")
+                        method_b = fb.get("method")
+                        if xg_raw is None or yg is None:
+                            continue
+                        xg_raw = np.asarray(xg_raw, dtype=float)
+                        yg = np.asarray(yg, dtype=float)
+                        if method_b == "spline":
+                            if dr_x_transform == "log1p":
+                                xg = np.expm1(xg_raw)
+                            elif dr_x_transform in {"log10", "log"}:
+                                xg = np.power(10.0, xg_raw)
+                            else:
+                                xg = xg_raw
+                        else:
+                            xg = xg_raw
+                        m = np.isfinite(xg) & np.isfinite(yg)
+                        if int(np.sum(m)) < 4:
+                            continue
+                        xs = xg[m]
+                        ys = yg[m]
+                        o = np.argsort(xs)
+                        xs = xs[o]
+                        ys = ys[o]
+                        if len(np.unique(xs)) < 2:
+                            continue
+                        y_boots.append(np.interp(x_plot, xs, ys, left=np.nan, right=np.nan))
+                    except Exception:
+                        continue
+                if y_boots:
+                    arr = np.asarray(y_boots, dtype=float)
+                    y_hat_q025 = np.nanpercentile(arr, 2.5, axis=0)
+                    y_hat_q975 = np.nanpercentile(arr, 97.5, axis=0)
+        except Exception:
+            pass
+        ec50_ci = None
+        if brow is not None:
+            lo = brow.get("ci95EC50.lo")
+            hi = brow.get("ci95EC50.up")
+            if (lo is None or (isinstance(lo, float) and np.isnan(lo))) and "EC50.low" in brow.index:
+                lo = brow.get("EC50.low")
+            if (hi is None or (isinstance(hi, float) and np.isnan(hi))) and "EC50.high" in brow.index:
+                hi = brow.get("EC50.high")
+            ec50_ci = [lo, hi]
+        dr_payload["bootstrap"] = {
+            "ran": True,
+            "ec50_ci": ec50_ci,
+            "n": brow.get("Samples") if brow is not None and "Samples" in brow else None,
+            "y_hat_q025": y_hat_q025,
+            "y_hat_q975": y_hat_q975,
+        }
     return dr_payload

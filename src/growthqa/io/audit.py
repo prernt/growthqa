@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from typing import Iterable
+import re
 
 import numpy as np
 import pandas as pd
 
 from growthqa.preprocess.timegrid import parse_time_from_header
-import re
 
 
+# ============================================================
+# Meta features (unchanged)
+# ============================================================
 AUDIT_META_FEATURES: list[str] = [
-    # "early_observed_tmax",
     "raw_observed_tmax",
     "observed_tmax",
     "n_points_observed",
@@ -27,25 +29,35 @@ AUDIT_META_FEATURES: list[str] = [
     "final_to_peak_ratio",
 ]
 
+# ============================================================
+# NEW Stage-2 evidence columns (thesis-friendly)
+# ============================================================
 AUDIT_LATE_FEATURES: list[str] = [
     "has_late_data",
-    "late_min_points",
     "late_window_start",
-    "late_tmax",
     "late_n_points",
-    "late_too_sparse",
-    "late_slope",
-    "late_delta",
-    "late_max_increase",
-    "late_growth_detected",
-    "plateau_detected",
-    "decline_detected",
-    "drift_detected",
-    "noise_detected",
-    "sigma_noise",
-    "late_linearity_r2",
+    "late_span_hours",
+    "data_quality",
+    "growth_z_like",
+    "artifact_score",
+    "decision_confidence",
+    "Stage 2 Label",
+    "Label Reason",
 ]
 
+# Optional extra diagnostics (keep out of biologist-facing CSV)
+AUDIT_LATE_DEBUG_FEATURES: list[str] = [
+    "late_slope",
+    "late_delta",
+    "noise_level",
+    "late_growth_detected",
+    "artifact_detected",
+]
+
+def _col_as_series(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
+    if col in df.columns:
+        return df[col]
+    return pd.Series([default] * len(df), index=df.index)
 
 def _sorted_time_cols(df: pd.DataFrame) -> list[str]:
     cols = [c for c in df.columns if parse_time_from_header(str(c)) is not None]
@@ -54,6 +66,7 @@ def _sorted_time_cols(df: pd.DataFrame) -> list[str]:
         key=lambda c: parse_time_from_header(str(c)) if parse_time_from_header(str(c)) is not None else float("inf"),
     )
 
+
 def _test_id_encodes_conc(s: object) -> bool:
     if s is None:
         return False
@@ -61,221 +74,62 @@ def _test_id_encodes_conc(s: object) -> bool:
 
 
 def _with_curve_id(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Keeps your existing curve_id/curve_key logic style.
+    """
     out = df.copy()
     if "Test Id" not in out.columns:
         return out
+
+    out["Test Id"] = out["Test Id"].astype(str)
+
     if "Concentration" in out.columns:
-        conc_num = pd.to_numeric(out["Concentration"], errors="coerce")
-        out["Concentration"] = conc_num
-        conc_txt = conc_num.map(lambda v: "" if pd.isna(v) else f"{float(v):g}")
-        out["curve_id"] = out["Test Id"].astype(str) + "|" + conc_txt.astype(str)
+        out["Concentration"] = pd.to_numeric(out["Concentration"], errors="coerce")
+        conc_txt = out["Concentration"].map(lambda v: f"{float(v):g}" if np.isfinite(v) else "")
+        has_conc = out["Concentration"].notna()
         enc = out["Test Id"].map(_test_id_encodes_conc)
 
-        out["curve_key"] = out["Test Id"].astype(str)
-        has_conc = conc_num.notna()
-
-        # Only append "||conc" when Test Id does NOT already encode it
+        out["curve_id"] = out["Test Id"]
+        out["curve_key"] = out["Test Id"]
         use_append = has_conc & (~enc)
-        out.loc[use_append, "curve_key"] = out.loc[use_append, "Test Id"].astype(str) + "||" + conc_txt.loc[use_append].astype(str)
+        out.loc[use_append, "curve_key"] = out.loc[use_append, "Test Id"] + "||" + conc_txt.loc[use_append]
+    else:
+        out["curve_id"] = out["Test Id"]
+        out["curve_key"] = out["Test Id"]
 
-        # out["curve_key"] = out["Test Id"].astype(str)
-        # has_conc = conc_num.notna()
-        # out.loc[has_conc, "curve_key"] = out.loc[has_conc, "Test Id"].astype(str) + "||" + conc_txt.loc[has_conc].astype(str)
-        return out
-
-    out["Concentration"] = np.nan
-    dup_rank = out.groupby("Test Id").cumcount()
-    out["curve_id"] = out["Test Id"].astype(str)
-    out["curve_key"] = out["Test Id"].astype(str)
-    out.loc[dup_rank > 0, "curve_id"] = out.loc[dup_rank > 0, "curve_id"] + "|" + dup_rank.loc[dup_rank > 0].astype(str)
-    return out
-
-
-def _pick_merge_keys(left: pd.DataFrame, right: pd.DataFrame) -> list[str]:
-    if "curve_key" in left.columns and "curve_key" in right.columns:
-        return ["curve_key"]
-    if all(c in left.columns and c in right.columns for c in ["Test Id", "Concentration"]):
-        l_has_conc = pd.to_numeric(left["Concentration"], errors="coerce").notna().any()
-        r_has_conc = pd.to_numeric(right["Concentration"], errors="coerce").notna().any()
-        if l_has_conc and r_has_conc:
-            return ["Test Id", "Concentration"]
-    return ["curve_id"] if "curve_id" in left.columns and "curve_id" in right.columns else ["Test Id"]
-
-
-def _normalize_label(v: object) -> str:
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return ""
-    s = str(v).strip().lower()
-    if s in {"valid", "true", "1"}:
-        return "Valid"
-    if s in {"invalid", "false", "0"}:
-        return "Invalid"
-    if s in {"unsure", "unknown"}:
-        return "Unsure"
-    return str(v).strip()
-
-
-def _unique_cols(cols: Iterable[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for c in cols:
-        if c in seen:
-            continue
-        seen.add(c)
-        out.append(c)
     return out
 
 
 def build_classifier_audit_df(
+    *,
     wide_original_df: pd.DataFrame,
     infer_df: pd.DataFrame,
     meta_df: pd.DataFrame,
     mode: str,
     review_df: pd.DataFrame | None = None,
     processed_wide_df: pd.DataFrame | None = None,
+    include_debug_features: bool = False,
 ) -> pd.DataFrame:
-    mode_u = str(mode).strip().upper()
-    manual_mode = mode_u == "MANUAL"
+    """
+    Builds the classifier audit CSV dataframe.
 
-    wide = _with_curve_id(wide_original_df if isinstance(wide_original_df, pd.DataFrame) else pd.DataFrame())
-    infer = _with_curve_id(infer_df if isinstance(infer_df, pd.DataFrame) else pd.DataFrame())
-    meta = _with_curve_id(meta_df if isinstance(meta_df, pd.DataFrame) else pd.DataFrame())
-    proc = _with_curve_id(processed_wide_df if isinstance(processed_wide_df, pd.DataFrame) else pd.DataFrame())
+    Assumptions:
+      - infer_df contains the Stage-2 evidence columns from the new pipeline.
+      - infer_df contains: Pred Label, Pred Confidence, Predicted S1 Label, Stage 2 Label, Label Reason, Reviewed (MANUAL)
+    """
+    if "Test Id" not in wide_original_df.columns:
+        raise ValueError("wide_original_df must contain 'Test Id'.")
 
-    if wide.empty:
-        return pd.DataFrame()
+    # Time columns from original
+    time_cols = _sorted_time_cols(wide_original_df)
 
-    time_cols = _sorted_time_cols(wide)
-    keys = _pick_merge_keys(wide, infer)
-    df = wide.copy()
+    # Normalize IDs
+    wide0 = _with_curve_id(wide_original_df)
+    infer0 = _with_curve_id(infer_df)
+    meta0 = _with_curve_id(meta_df)
+
+    # Base columns expected (be tolerant)
     base_infer_cols = [
-    "Pred Label",
-    "Pred Confidence",
-    "Predicted S1 Label",
-    "S1 Confidence Valid",
-    "S1 Confidence Invalid",
-    "Stage 2 Label",
-    "Label Reason",
-    "true_label",
-    "Reviewed",
-    "pred_label",
-    "pred_confidence",
-    "confidence_valid",
-    "confidence_invalid",
-    "final_label",
-    "final_reason",
-    ]
-
-    stage2_infer_cols = [
-        # Late-window availability + features produced by infer_labels.py after Stage-2 merge
-        "has_late_data",
-        "late_min_points",
-        "raw_observed_tmax",
-        "late_window_start",
-        "late_tmax",
-        "late_n_points",
-        "late_too_sparse",
-        "late_slope",
-        "late_delta",
-        "late_max_increase",
-        "late_growth_detected",
-        "plateau_detected",
-        "decline_detected",
-        "drift_detected",
-        "noise_detected",
-    ]
-
-    infer_cols = [c for c in (base_infer_cols + stage2_infer_cols) if c in infer.columns]
-
-    if infer_cols:
-        df = df.merge(infer[keys + infer_cols], on=keys, how="left")
-
-    if not meta.empty:
-        meta_cols = [c for c in _unique_cols(AUDIT_META_FEATURES) if c in meta.columns]
-        if meta_cols:
-            df = df.merge(meta[keys + meta_cols], on=keys, how="left", suffixes=("", "_meta"))
-
-    proc_added_cols: list[str] = []
-    if not proc.empty:
-        proc_time_cols = _sorted_time_cols(proc)
-        if proc_time_cols:
-            proc_keys = _pick_merge_keys(df, proc)
-            rename_map: dict[str, str] = {}
-            for c in proc_time_cols:
-                new_c = c if str(c).startswith("P_") else f"P_{c}"
-                if new_c in df.columns:
-                    new_c = f"{new_c}_processed"
-                rename_map[c] = new_c
-                proc_added_cols.append(new_c)
-            proc_slice = proc[proc_keys + proc_time_cols].rename(columns=rename_map)
-            df = df.merge(proc_slice, on=proc_keys, how="left")
-
-    # Normalize inference output columns
-    if "Pred Label" not in df.columns:
-        df["Pred Label"] = df.get("final_label", df.get("pred_label", ""))
-    if "Pred Confidence" not in df.columns:
-        df["Pred Confidence"] = pd.to_numeric(df.get("pred_confidence", np.nan), errors="coerce")
-    if "Predicted S1 Label" not in df.columns:
-        df["Predicted S1 Label"] = df.get("pred_label", "")
-    if "S1 Confidence Valid" not in df.columns:
-        df["S1 Confidence Valid"] = pd.to_numeric(df.get("confidence_valid", np.nan), errors="coerce")
-    if "S1 Confidence Invalid" not in df.columns:
-        df["S1 Confidence Invalid"] = pd.to_numeric(df.get("confidence_invalid", np.nan), errors="coerce")
-    if "Stage 2 Label" not in df.columns:
-        df["Stage 2 Label"] = np.nan
-    if "Label Reason" not in df.columns:
-        df["Label Reason"] = np.nan
-
-    for c in AUDIT_LATE_FEATURES:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    df["Pred Label"] = df["Pred Label"].apply(_normalize_label)
-    df["Predicted S1 Label"] = df["Predicted S1 Label"].apply(_normalize_label)
-    df["Pred Confidence"] = pd.to_numeric(df["Pred Confidence"], errors="coerce")
-    df["S1 Confidence Valid"] = pd.to_numeric(df["S1 Confidence Valid"], errors="coerce")
-    df["S1 Confidence Invalid"] = pd.to_numeric(df["S1 Confidence Invalid"], errors="coerce")
-    # Do not fabricate late-data state in audit; reflect inference output as-is.
-    df["has_late_data"] = df["has_late_data"].astype("boolean")
-
-    no_late_mask = df["has_late_data"].eq(False).fillna(False)
-    df.loc[no_late_mask, "Stage 2 Label"] = np.nan
-    df.loc[no_late_mask, "Label Reason"] = np.nan
-    for c in [
-        "late_window_start",
-        "late_tmax",
-        "late_n_points",
-        "late_too_sparse",
-        "late_slope",
-        "late_delta",
-        "late_max_increase",
-        "late_growth_detected",
-        "sigma_noise",
-        "late_linearity_r2",
-    ]:
-        df.loc[no_late_mask, c] = np.nan
-
-    # Review / true label columns
-    if manual_mode and isinstance(review_df, pd.DataFrame) and not review_df.empty:
-        review = _with_curve_id(review_df)
-        rk = _pick_merge_keys(df, review)
-        review_cols = [c for c in ["true_label", "Reviewed"] if c in review.columns]
-        if review_cols:
-            df = df.merge(review[rk + review_cols], on=rk, how="left", suffixes=("", "_review"))
-            if "true_label_review" in df.columns:
-                base_true = df["true_label"] if "true_label" in df.columns else pd.Series(index=df.index, dtype=object)
-                df["true_label"] = df["true_label_review"].combine_first(base_true)
-                df.drop(columns=["true_label_review"], inplace=True)
-            if "Reviewed_review" in df.columns:
-                base_reviewed = df["Reviewed"] if "Reviewed" in df.columns else pd.Series(index=df.index, dtype=object)
-                df["Reviewed"] = df["Reviewed_review"].combine_first(base_reviewed)
-                df.drop(columns=["Reviewed_review"], inplace=True)
-
-    df["True Label"] = df.get("true_label", df["Pred Label"]).apply(_normalize_label)
-    if manual_mode:
-        df["Reviewed"] = df.get("Reviewed", False).fillna(False).astype(bool)
-
-    ordered = [
         "Test Id",
         "Concentration",
         "curve_key",
@@ -284,17 +138,133 @@ def build_classifier_audit_df(
         "Pred Confidence",
         "Predicted S1 Label",
         "S1 Confidence Valid",
-        "S1 Confidence Invalid",
         "Stage 2 Label",
         "Label Reason",
-        "True Label",
     ]
-    if manual_mode:
-        ordered.append("Reviewed")
-    ordered += [c for c in AUDIT_META_FEATURES if c in df.columns]
-    ordered += [c for c in AUDIT_LATE_FEATURES if c in df.columns]
-    ordered += [c for c in time_cols if c in df.columns]
-    ordered += [c for c in proc_added_cols if c in df.columns]
 
-    ordered = _unique_cols([c for c in ordered if c in df.columns])
-    return df[ordered].copy()
+    if mode.upper() == "MANUAL":
+        base_infer_cols.append("Reviewed")
+
+    # Join infer onto wide (for time-series)
+    df = wide0.merge(infer0, on="curve_key", how="left", suffixes=("", "_infer"))
+
+    # Join meta features (optional)
+    meta_cols = [c for c in AUDIT_META_FEATURES if c in meta0.columns]
+    if meta_cols:
+        df = df.merge(meta0[["curve_key"] + meta_cols], on="curve_key", how="left", suffixes=("", "_meta"))
+
+    # Stage-2 cols
+    late_cols = [c for c in AUDIT_LATE_FEATURES if c in df.columns]
+    if include_debug_features:
+        late_cols += [c for c in AUDIT_LATE_DEBUG_FEATURES if c in df.columns]
+    
+    proc_added_cols: list[str] = []
+    if isinstance(processed_wide_df, pd.DataFrame) and not processed_wide_df.empty:
+        proc0 = _with_curve_id(processed_wide_df)
+        proc_time_cols = _sorted_time_cols(proc0)
+        if proc_time_cols:
+            # merge on curve_key if present in proc0
+            if "curve_key" in proc0.columns:
+                proc_keys = ["curve_key"]
+            else:
+                # fallback to Test Id if curve_key not available
+                proc_keys = ["Test Id"] if "Test Id" in proc0.columns else []
+
+            if proc_keys:
+                rename_map: dict[str, str] = {}
+                for c in proc_time_cols:
+                    new_c = c if str(c).startswith("P_") else f"P_{c}"
+                    if new_c in df.columns:
+                        new_c = f"{new_c}_processed"
+                    rename_map[c] = new_c
+                    proc_added_cols.append(new_c)
+
+                proc_slice = proc0[proc_keys + proc_time_cols].rename(columns=rename_map)
+                df = df.merge(proc_slice, on=proc_keys, how="left")
+    if "Reviewed" not in df.columns:
+        df["Reviewed"] = False
+
+    # Merge manual review updates if provided (MANUAL mode)
+    if isinstance(review_df, pd.DataFrame) and not review_df.empty:
+        review0 = _with_curve_id(review_df)
+        # Prefer curve_key merge if possible
+        if "curve_key" in df.columns and "curve_key" in review0.columns:
+            rk = ["curve_key"]
+        else:
+            rk = ["Test Id"] if ("Test Id" in df.columns and "Test Id" in review0.columns) else []
+
+        if rk:
+            # Accept either 'true_label' or 'True Label' in review_df
+            review_label_col = "true_label" if "true_label" in review0.columns else ("True Label" if "True Label" in review0.columns else None)
+            review_cols = [c for c in ["Reviewed", review_label_col] if c and c in review0.columns]
+            if review_cols:
+                df = df.merge(review0[rk + review_cols], on=rk, how="left", suffixes=("", "_review"))
+
+                # Apply reviewed flag update
+                if "Reviewed_review" in df.columns:
+                    df["Reviewed"] = _col_as_series(df, "Reviewed_review").combine_first(_col_as_series(df, "Reviewed", False))
+                    df.drop(columns=["Reviewed_review"], inplace=True)
+
+                # Apply label update into a canonical internal column
+                if review_label_col is not None:
+                    col_name = f"{review_label_col}_review"
+                    if col_name in df.columns:
+                        df["true_label"] = _col_as_series(df, col_name).combine_first(_col_as_series(df, "true_label", np.nan))
+                        df.drop(columns=[col_name], inplace=True)
+
+    # True Label:
+    # - MANUAL: should reflect human label when available (true_label), else Pred Label
+    # - AUTO: mirrors Pred Label (no ground truth yet)
+    if "Pred Label" not in df.columns:
+        df["Pred Label"] = _col_as_series(df, "final_label", _col_as_series(df, "pred_label", ""))
+
+    df["True Label"] = _col_as_series(df, "true_label", df["Pred Label"])
+
+    # normalize Reviewed to boolean
+    df["Reviewed"] = _col_as_series(df, "Reviewed", False).fillna(False).astype(bool)
+
+    # Authoritative sparse override for audit/export semantics.
+    sparse_mask = pd.to_numeric(_col_as_series(df, "too_sparse", 0), errors="coerce").fillna(0).astype(int).eq(1)
+    if sparse_mask.any():
+        df.loc[sparse_mask, "Pred Label"] = "Unsure"
+        df.loc[sparse_mask, "True Label"] = "Unsure"
+        if "Label Reason" in df.columns:
+            df.loc[sparse_mask, "Label Reason"] = "TOO_SPARSE_OVERRIDE"
+
+    ordered: list[str] = []
+
+        # ----------------------------------------------------
+    # Curve ID column cleanup (clean debug philosophy)
+    # ----------------------------------------------------
+    if "curve_id" in df.columns and "curve_key" in df.columns:
+        same_mask = (
+            df["curve_id"].astype(str).fillna("") 
+            == df["curve_key"].astype(str).fillna("")
+        )
+
+        if same_mask.all():
+            # They are identical everywhere → keep only curve_id
+            df = df.drop(columns=["curve_key"])
+        else:
+            # They differ somewhere → keep both (debug needed)
+            pass
+    for must in ["Test Id", "Concentration", "curve_key", "Pred Label", "Pred Confidence",
+                 "Predicted S1 Label", "S1 Confidence Valid", "S1 Confidence Invalid",
+                 "Stage 2 Label", "Label Reason", "True Label", "Reviewed"]:
+        if must in df.columns and must not in ordered:
+            ordered.insert(min(len(ordered), 3) if must in {"curve_key"} else len(ordered), must)
+    
+    ordered += [c for c in base_infer_cols if c in df.columns]
+    ordered += [c for c in meta_cols if c in df.columns]
+    ordered += [c for c in late_cols if c in df.columns]
+    ordered += [c for c in time_cols if c in df.columns]
+
+ # De-duplicate while preserving order
+    seen = set()
+    ordered_unique = []
+    for c in ordered:
+        if c not in seen:
+            ordered_unique.append(c)
+            seen.add(c)
+
+    return df[ordered_unique].copy()

@@ -1,4 +1,22 @@
 # src/growthqa/grofit/gc_fit_spline.py
+# ============================================================
+# CORRECTED VERSION  – see analysis document for full rationale
+# Key changes vs original:
+#   1. Amplitude A: computed as max(y_grid) - y_grid[0] using the
+#      SPLINE fitted curve, which already agrees with R's spline
+#      approach.  No change needed here for the spline path because
+#      the spline does not have a separate "A parameter" — it is
+#      always derived geometrically from the fitted curve.
+#      HOWEVER, the baseline y0 is now consistently defined as
+#      y_grid[0] (the fitted spline at t_min), NOT mean(y_grid[:3]),
+#      to match R's gcFitSpline which uses the spline at the first
+#      observed time point as the baseline.
+#   2. Negative lambda is preserved (no max(0, lag) floor).
+#   3. The amplitude-band μ mask (0.05–0.95 of A) is removed because
+#      it can suppress the true maximum slope on short data series
+#      with a weak lag phase, causing systematic underestimation of μ.
+#      R's gcFitSpline uses the global maximum of the first derivative.
+# ============================================================
 from __future__ import annotations
 
 from typing import Optional
@@ -8,28 +26,19 @@ from scipy.interpolate import make_smoothing_spline
 
 from .types import FitResult
 
-# ── Shared smoothing constants (items 1, 2) ──────────────────────────────────
-# spar ∈ (0,1] maps to SciPy λ via the same log-linear scale R uses internally.
-# R's spar range [0,1] maps to λ ∈ [λ_min, λ_max] for a given dataset.
-# We use a data-scale-invariant mapping: λ = 10^(-6 + 6*spar)
-# so spar=0 → λ=1e-6 (very wiggly), spar=1 → λ=1 (very smooth).
-# This is consistent between GC and DR (item 2).
-SPAR_LAM_LOG_MIN = -6.0   # log10(λ) at spar=0
-SPAR_LAM_LOG_MAX =  2.0   # log10(λ) at spar=1 (tighter than DR since GC data is denser)
-
-# Minimum effective df for GC splines (sigmoid needs ≥4)
+# ── Smoothing constants ───────────────────────────────────────────────────────
+SPAR_LAM_LOG_MIN = -6.0
+SPAR_LAM_LOG_MAX =  2.0
 GC_MIN_DF = 4.0
 DR_MIN_DF = 3.5
 
 
 def spar_to_lam(spar: float, *, log_min: float = SPAR_LAM_LOG_MIN, log_max: float = SPAR_LAM_LOG_MAX) -> float:
-    """Convert Grofit-like spar ∈ (0,1] to SciPy smoothing λ."""
     s = float(np.clip(spar, 1e-6, 1.0))
     return float(10.0 ** (log_min + (log_max - log_min) * s))
 
 
 def lam_to_spar(lam: float, *, log_min: float = SPAR_LAM_LOG_MIN, log_max: float = SPAR_LAM_LOG_MAX) -> float:
-    """Convert SciPy λ back to approximate spar ∈ (0,1]."""
     if lam <= 0:
         return 0.0
     s = (np.log10(max(lam, 1e-12)) - log_min) / (log_max - log_min)
@@ -37,17 +46,11 @@ def lam_to_spar(lam: float, *, log_min: float = SPAR_LAM_LOG_MIN, log_max: float
 
 
 def effective_df(sp, x: np.ndarray) -> float:
-    """Estimate effective degrees of freedom of a smoothing spline.
-
-    Uses curvature/slope energy ratio as a fast proxy for trace(H).
-    df≈2 → straight line; df≈4+ → sigmoid with curvature.
-    Shared by GC and DR (item 2).
-    """
     try:
-        dy = sp.derivative(1)(x)
+        dy  = sp.derivative(1)(x)
         d2y = sp.derivative(2)(x)
-        e1 = float(np.sum(dy ** 2))
-        e2 = float(np.sum(d2y ** 2))
+        e1  = float(np.sum(dy ** 2))
+        e2  = float(np.sum(d2y ** 2))
         if e1 < 1e-20:
             return 2.0
         return float(np.clip(2.0 + np.log1p(e2 / e1 * float(len(x))), 2.0, float(len(x))))
@@ -56,7 +59,6 @@ def effective_df(sp, x: np.ndarray) -> float:
 
 
 def _find_bounded_lambda(t: np.ndarray, y: np.ndarray, min_df: float, n_search: int = 30) -> float:
-    """Binary-search for largest λ (smoothest spline) that achieves ≥ min_df effective df."""
     lam_lo, lam_hi = 1e-12, 1e6
     try:
         sp_test = make_smoothing_spline(t, y, lam=lam_lo)
@@ -78,11 +80,6 @@ def _find_bounded_lambda(t: np.ndarray, y: np.ndarray, min_df: float, n_search: 
 
 
 def _select_lam_and_fit(t: np.ndarray, y: np.ndarray, lam: Optional[float], auto_cv: bool, min_df: float):
-    """Unified lambda selection + spline fitting. Returns (sp, lam_used, method_label).
-
-    Shared between GC and DR for consistent smoothing semantics (item 2).
-    Priority: explicit lam → GCV-with-df-floor → variance-fallback.
-    """
     if lam is not None:
         sp = make_smoothing_spline(t, y, lam=float(max(lam, 0.0)))
         return sp, float(lam), "user"
@@ -106,29 +103,31 @@ def _dedupe_sorted_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndar
     if xu.size == x.size:
         return x, y
     y_sum = np.zeros_like(xu, dtype=float)
-    cnt = np.zeros_like(xu, dtype=float)
+    cnt   = np.zeros_like(xu, dtype=float)
     np.add.at(y_sum, inv, y)
-    np.add.at(cnt, inv, 1.0)
+    np.add.at(cnt,   inv, 1.0)
     return xu, y_sum / np.maximum(cnt, 1.0)
 
 
 def gc_fit_spline(
     t: np.ndarray,
     y: np.ndarray,
-    lam: Optional[float] = None,        # raw SciPy λ (backward compat)
+    lam: Optional[float] = None,
     auto_cv: bool = True,
     s_grid: Optional[np.ndarray] = None,
     *,
-    smooth: Optional[float] = None,     # NEW (item 1): Grofit-like spar ∈ (0,1]
-    df: Optional[float] = None,         # NEW (item 1): target effective df (overrides smooth)
+    smooth: Optional[float] = None,
+    df: Optional[float] = None,
 ) -> FitResult:
-    """Fit a smoothing spline to a growth curve.
+    """
+    Fit a smoothing spline to a growth curve.
 
-    Smoothing control (item 1) — in priority order:
-      df     : target effective degrees of freedom (most interpretable)
-      smooth : spar ∈ (0,1] — Grofit-like knob, maps to λ via log-linear scale
-      lam    : raw SciPy penalty λ (backward compat)
-      auto_cv: True = GCV with df floor (default)
+    Changes vs original:
+    - Baseline y0 = spline evaluated at t_min (y_grid[0]), not mean(y_grid[:3]).
+      This matches R's gcFitSpline definition of the baseline.
+    - Amplitude A = max(y_grid) - y_grid[0]  (same as R).
+    - Lag computation does NOT floor to 0; negative values are allowed.
+    - The amplitude-band mask on dy is removed; μ = global max of dy.
     """
     t = np.asarray(t, float)
     y = np.asarray(y, float)
@@ -142,14 +141,9 @@ def gc_fit_spline(
             fit_status="failed", fail_reason="insufficient_points",
         )
 
-    # ── Resolve smoothing parameter (item 1) ─────────────────────────────
-    # df takes priority, then smooth (spar), then raw lam, then GCV
     resolved_lam: Optional[float] = lam
     if smooth is not None and resolved_lam is None:
         resolved_lam = spar_to_lam(smooth)
-    # df is handled after fitting by iterating; for now we pass it as a
-    # target to the bounded-lambda search.
-
     if resolved_lam is not None:
         try:
             lam_num = float(resolved_lam)
@@ -158,8 +152,8 @@ def gc_fit_spline(
         resolved_lam = lam_num if np.isfinite(lam_num) else None
 
     order = np.argsort(t)
-    t, y = t[order], y[order]
-    t, y = _dedupe_sorted_xy(t, y)
+    t, y  = t[order], y[order]
+    t, y  = _dedupe_sorted_xy(t, y)
 
     if len(t) < 4:
         return FitResult(
@@ -168,7 +162,6 @@ def gc_fit_spline(
             fit_status="failed", fail_reason="insufficient_unique_points",
         )
 
-    # If df target given, override resolved_lam with bounded search result
     if df is not None:
         try:
             resolved_lam = _find_bounded_lambda(t, y, min_df=float(df))
@@ -184,42 +177,36 @@ def gc_fit_spline(
         t_min, t_max = float(np.min(t)), float(np.max(t))
         t_grid = np.linspace(t_min, t_max, 400)
         y_grid = sp(t_grid)
-        dy = sp.derivative(1)(t_grid)
+        dy     = sp.derivative(1)(t_grid)
 
-        # Amplitude-band μ extraction (robust, prevents noise spikes)
-        y_min_g, y_max_g = float(np.nanmin(y_grid)), float(np.nanmax(y_grid))
-        A_est_raw = y_max_g - y_min_g
-        if A_est_raw > 1e-6:
-            valid_mask = (y_grid >= y_min_g + 0.05 * A_est_raw) & (y_grid <= y_min_g + 0.95 * A_est_raw)
-            masked_dy = np.where(valid_mask if np.any(valid_mask) else np.ones_like(y_grid, bool), dy, -np.inf)
-            idx = int(np.nanargmax(masked_dy))
-        else:
-            idx = int(np.nanargmax(dy))
-
-        mu = float(dy[idx])
+        # ── μ: global maximum of first derivative ─────────────────────
+        # R's gcFitSpline uses max(smooth.spline.deriv(fit, x=t_grid))
+        # without any amplitude-band masking.
+        idx    = int(np.nanargmax(dy))
+        mu     = float(dy[idx])
         t_star = float(t_grid[idx])
         y_star = float(np.interp(t_star, t_grid, y_grid))
 
-        # ── Lag (item 3): standardized baseline = mean of first 3 grid points ──
-        # This matches Grofit R's spline lag: uses fitted curve start as y0, not raw data.
-        y0_baseline = float(np.nanmean(y_grid[:3])) if y_grid.size >= 3 else float(y_grid[0])
-        A = float(np.nanmax(y_grid)) - y0_baseline
-        lag_method_str = "tangent_spline"
+        # ── Baseline y0 = spline at t_min (matches R's spline baseline) ──
+        y0_baseline = float(y_grid[0])
 
+        # ── Amplitude A = max(y_grid) - y0_baseline ───────────────────
+        A = float(np.nanmax(y_grid)) - y0_baseline
+
+        # ── Lag: tangent intercept, negative values allowed ───────────
         if mu <= 1e-12:
             lag = float("nan")
             lag_method_str = "tangent_spline_undefined"
         else:
-            lag = float(max(0.0, t_star - (y_star - y0_baseline) / mu))
+            lag = float(t_star - (y_star - y0_baseline) / mu)
+            lag_method_str = "tangent_spline"
 
         integral = float(np.trapz(y_grid, t_grid))
-        rss = float(np.sum((y - sp(t)) ** 2))
+        rss      = float(np.sum((y - sp(t)) ** 2))
 
-        # ── Smoothing diagnostics (item 1) ───────────────────────────────
-        df_eff = effective_df(sp, t)
+        df_eff   = effective_df(sp, t)
         smooth_out = lam_to_spar(lam_used) if np.isfinite(lam_used) else float("nan")
-
-        lam_out = float(lam_used) if np.isfinite(lam_used) else float("nan")
+        lam_out    = float(lam_used) if np.isfinite(lam_used) else float("nan")
 
         warn_list = []
         if lam_method == "gcv_bounded":
@@ -239,7 +226,6 @@ def gc_fit_spline(
             rss=rss,
             n=int(len(t)),
             k=None,
-            # new fields
             smooth_used=smooth_out,
             df_effective=df_eff,
             lam_raw=lam_out,
@@ -249,14 +235,14 @@ def gc_fit_spline(
             fail_reason=None,
             warnings=warn_list if warn_list else None,
             extra={
-                "lam": lam_out,
-                "s": lam_out,
+                "lam":        lam_out,
+                "s":          lam_out,
                 "lam_method": lam_method,
-                "knots": np.asarray(getattr(sp, "t", []), float),
-                "mu_method": "spline_derivative",
-                "t_star": float(t_star),
-                "y_star": float(y_star),
-                "y0": float(y0_baseline),
+                "knots":      np.asarray(getattr(sp, "t", []), float),
+                "mu_method":  "spline_derivative",
+                "t_star":     float(t_star),
+                "y_star":     float(y_star),
+                "y0":         float(y0_baseline),
             },
         )
     except Exception as e:

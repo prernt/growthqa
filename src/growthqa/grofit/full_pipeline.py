@@ -32,11 +32,16 @@ class FullGrofitPipelineConfig:
     dr_boot_B: int = 300
     random_state: int = 42
 
+
     # spline behavior in grofit stage
     spline_auto_cv: bool = True
     spline_s: Optional[float] = None
-    dr_x_transform: Optional[str] = "log1p"
+    dr_x_transform: Optional[str] = None
+    dr_y_transform: Optional[str] = None
+    smooth_gc: Optional[float] = None
+    smooth_dr: Optional[float] = None
     dr_fit_method: str = "auto"
+    dr_s: Optional[float] = None
 
 
 # ============================================================
@@ -256,6 +261,10 @@ def run_full_input_to_grofit(
         spline_auto_cv=cfg.spline_auto_cv,
         spline_s=cfg.spline_s,
         dr_x_transform=cfg.dr_x_transform,
+        dr_y_transform=cfg.dr_y_transform,
+        smooth_gc=cfg.smooth_gc,
+        smooth_dr=cfg.smooth_dr,
+        dr_s=cfg.dr_s,
         dr_fit_method=cfg.dr_fit_method,
         random_state=cfg.random_state,
         export_dir=outdir if output_mode == "r_style" else None,

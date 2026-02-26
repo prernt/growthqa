@@ -14,6 +14,9 @@ def dr_boot_spline(
     random_state: Optional[int] = None,
     x_transform: Optional[str] = "log1p",
     lam: Optional[float] = None,
+    auto_cv: bool = True,
+    smooth: Optional[float] = None,
+    y_transform: Optional[str] = None,
 ) -> Dict[str, Any]:
     rng = np.random.default_rng(random_state)
     x = np.asarray(conc, float)
@@ -36,6 +39,8 @@ def dr_boot_spline(
             x_transform=x_transform,
             lam=None,
             auto_cv=True,
+            smooth=smooth,
+            y_transform=y_transform,
             enforce_monotonic=False,
             fallback_to_4pl=False,
         )
@@ -63,6 +68,8 @@ def dr_boot_spline(
             x_transform=x_transform,
             lam=lam_to_use,
             auto_cv=False,
+            smooth=smooth,
+            y_transform=y_transform,
             enforce_monotonic=True,
             fallback_to_4pl=True,
         )

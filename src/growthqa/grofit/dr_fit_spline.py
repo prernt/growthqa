@@ -9,7 +9,7 @@ from scipy.linalg import svd
 
 from .dr_fit_model import dr_fit_model
 from .parametric_models import aic_from_rss
-from .gc_fit_spline import effective_df, _find_bounded_lambda, DR_MIN_DF
+from .gc_fit_spline import effective_df, _find_bounded_lambda, DR_MIN_DF,spar_to_lam
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +245,8 @@ def dr_fit_spline(
     x_transform: Optional[str] = "log1p",
     lam: Optional[float] = None,
     auto_cv: bool = True,
+    smooth: Optional[float] = None,          # NEW: Grofit-like spar ∈ (0,1]
+    y_transform: Optional[str] = None,       
     *,
     enforce_monotonic: bool = True,
     fallback_to_4pl: bool = True,
@@ -279,6 +281,23 @@ def dr_fit_spline(
     """
     x = np.asarray(conc, float)
     y = np.asarray(resp, float)
+
+    y_transform_norm = (y_transform or "none").lower()
+    if y_transform_norm in {"log1p", "ln1p"}:
+        if np.nanmin(y) < -1.0:
+            return {"success": False, "message": "y has values < -1 for log1p", "fail_reason": "dr_y_transform_invalid_lt_minus1", "n": int(len(x))}
+        y = np.log1p(y)
+    elif y_transform_norm in {"log10", "log"}:
+        if np.nanmin(y) <= 0.0:
+            return {"success": False, "message": "y has values <= 0 for log10", "fail_reason": "dr_y_transform_invalid_nonpositive", "n": int(len(x))}
+        y = np.log10(y)
+    else:
+        y_transform_norm = "none"
+
+    if smooth is not None and lam is None:
+        lam = spar_to_lam(float(smooth))
+        auto_cv = False
+
 
     mask = np.isfinite(x) & np.isfinite(y)
     x = x[mask]
@@ -445,6 +464,13 @@ def dr_fit_spline(
         ec50_status = ec50_status if ec50_status != "OK" else "no_ec50_crossing"
 
     y_ec50 = float(np.interp(ec50_xt, grid, y_hat)) if np.isfinite(ec50_xt) else float("nan")
+    if y_transform_norm == "log1p" and np.isfinite(y_ec50):
+        y_ec50_orig = float(np.expm1(y_ec50))
+    elif y_transform_norm in {"log10", "log"} and np.isfinite(y_ec50):
+        y_ec50_orig = float(np.power(10.0, y_ec50))
+    else:
+        y_ec50_orig = y_ec50
+
 
     # --- Residuals and fit quality on raw y ---
     y_fit_at_data = sp(xt)
@@ -469,6 +495,8 @@ def dr_fit_spline(
         "n": int(len(x)),
         "x_transform": x_transform,
         "x_transform_norm": x_transform_norm,
+        "y_transform": y_transform,
+        "y_transform_norm": y_transform_norm,
         "method": "spline",
         "lam_method": lam_method,
         "lam": lam_out,
@@ -481,7 +509,7 @@ def dr_fit_spline(
         "ec50": ec50_orig,
         "ec50_status": ec50_status,
         "y_ec50": y_ec50,
-
+        "y_ec50_orig": y_ec50_orig,
         "endpoint_low": y0,
         "endpoint_high": y1,
         "target_response": target,

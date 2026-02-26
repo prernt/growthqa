@@ -45,7 +45,51 @@ from growthqa.io.wide_format import long_to_wide_preserve_times, parse_any_file_
 from growthqa.io.audit import build_classifier_audit_df
 from growthqa.io.grofit_io import build_grofit_input_df as build_grofit_input_artifact
 from growthqa.pipelines.build_meta_dataset import run_merge_preprocess_meta
-from growthqa.features.meta import compute_late_growth_features
+# compute_late_growth_features: inline fallback so the app does not depend on
+# a specific version of growthqa.features.meta.  The canonical Stage-2 logic is
+# in growthqa.stage2.late_window; this lightweight version is only used by the
+# in-app _late_growth_map_from_wide pre-scan.
+try:
+    from growthqa.features.meta import compute_late_growth_features
+except ImportError:
+    def compute_late_growth_features(
+        times: np.ndarray, ods: np.ndarray, start: float = 16.0
+    ) -> dict:
+        """Fallback: simple late-growth detector used only for UI pre-scan."""
+        import numpy as _np
+        t = _np.array(times, dtype=float)
+        y = _np.array(ods, dtype=float)
+        ok = _np.isfinite(t) & _np.isfinite(y)
+        t, y = t[ok], y[ok]
+        out = {"has_late_data": 0, "late_growth_detected": 0,
+               "late_slope": float("nan"), "late_delta": float("nan"),
+               "late_max_increase": float("nan"), "late_n_points": 0}
+        if t.size == 0:
+            return out
+        t, y = t[_np.argsort(t)], y[_np.argsort(t)]
+        late = t > float(start)
+        if not _np.any(late):
+            return out
+        t_l, y_l = t[late], y[late]
+        out["has_late_data"] = 1
+        out["late_n_points"] = int(t_l.size)
+        if t_l.size >= 2:
+            dt, dy = _np.diff(t_l), _np.diff(y_l)
+            good = dt > 1e-12
+            if _np.any(good):
+                out["late_slope"] = float(_np.nanmedian(dy[good] / dt[good]))
+        ref = (t >= float(start)) & (t <= float(start + 2.0))
+        if _np.any(ref):
+            out["late_delta"] = float(_np.nanmedian(y_l[-max(1, int(_np.ceil(0.2 * y_l.size))):])
+                                      - _np.nanmedian(y[ref]))
+        od0 = float(_np.interp(float(start), t, y)) if t.size >= 2 else float("nan")
+        if _np.isfinite(od0):
+            out["late_max_increase"] = float(_np.nanmax(y_l) - od0)
+        slope_ok = _np.isfinite(out["late_slope"])  and out["late_slope"]      > 0.01
+        delta_ok = _np.isfinite(out["late_delta"])  and out["late_delta"]      > 0.03
+        inc_ok   = _np.isfinite(out["late_max_increase"]) and out["late_max_increase"] > 0.05
+        out["late_growth_detected"] = int(slope_ok or delta_ok or inc_ok)
+        return out
 from growthqa.viz.payloads import build_curve_payloads, build_dr_payload
 from growthqa.pipelines.infer_labels import run_label_inference_from_uploaded_wide
 
@@ -92,10 +136,13 @@ class GrofitOptions:
     gc_boot_B: int = 200
     dr_boot_B: int = 300
     spline_auto_cv: bool = True
-    spline_s: float | None = None
-    dr_s: float | None = None
-    dr_x_transform: str | None = "log1p"
-    bootstrap_method: str = "pairs"
+    spline_s: float | None = None          # legacy: manual spline smoothing param
+    dr_s: float | None = None              # legacy: manual DR smoothing param
+    smooth_gc: float | None = None         # Grofit-R-style smooth.gc spar ∈ (0,1]
+    smooth_dr: float | None = None         # Grofit-R-style smooth.dr spar ∈ (0,1]
+    dr_x_transform: str | None = None
+    dr_y_transform: str | None = None
+    bootstrap_method: str = None
 
 
 # =========================
@@ -143,6 +190,11 @@ def _safe_float(x, default=None):
 
 def _to_numeric_scalar(x) -> float:
     return float(pd.to_numeric(pd.Series([x]), errors="coerce").iloc[0])
+
+
+def _normalize_bootstrap_method(v: object) -> str:
+    s = str(v).strip().lower()
+    return s if s in {"pairs", "residual"} else "pairs"
 
 
 def _isfinite_scalar(x) -> bool:
@@ -1083,6 +1135,13 @@ def _build_export_zip(
     auto_preferred_model: str | None = None,
     auto_response_metric: str | None = None,
     auto_dr_bootstrap: str | None = None,
+    selected_gc_bootstrap: str | None = None,
+    selected_preferred_fit: str | None = None,
+    selected_response_metric: str | None = None,
+    selected_dr_bootstrap: str | None = None,
+    export_label_filter: str = "Valid",
+    export_dr_include_unsure: bool = False,
+    export_dr_include_invalid: bool = False,
     audit_df: pd.DataFrame | None = None,
     grofit_df: pd.DataFrame | None = None,
     grofit_tidy_all: pd.DataFrame | None = None,
@@ -1106,22 +1165,48 @@ def _build_export_zip(
         audit_df=classifier_df,
     )
 
+    # Load feature list from saved manifest if available (for reproducibility in thesis)
+    _feature_list = None
+    try:
+        import json as _json
+        _feat_path = Path(MODEL_DIR) / "stage1_features.json"
+        if _feat_path.exists():
+            _feature_list = _json.loads(_feat_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+
+    grofit_opts_info = dict(grofit_opts.__dict__)
+    grofit_opts_info["bootstrap_method"] = _normalize_bootstrap_method(grofit_opts_info.get("bootstrap_method"))
+
     run_info = {
         "mode": mode_label,
         "timestamp": datetime.now().isoformat(),
         "file_stem": file_stem,
         "predicting_model": predicting_model,
-        "grofit_options": grofit_opts.__dict__,
-        "settings": settings.__dict__,
+        "grofit_options": grofit_opts_info,
+        "inference_settings": settings.__dict__,
         "stage2_thresholds": stage2_config,
+        "stage1_feature_list": _feature_list,
         "auto_options": {
             "bootstrap_scope": auto_bootstrap_scope,
             "preferred_model": auto_preferred_model,
             "response_metric": auto_response_metric,
             "dr_bootstrap": auto_dr_bootstrap,
+            "export_label_filter": export_label_filter,
+            "export_dr_include_unsure": bool(export_dr_include_unsure),
+            "export_dr_include_invalid": bool(export_dr_include_invalid),
         }
         if mode_label == "AUTO"
         else None,
+        "pipeline_filters": {
+            "gc_bootstrap": selected_gc_bootstrap,
+            "preferred_fit": selected_preferred_fit,
+            "response_metric": selected_response_metric,
+            "dr_bootstrap": selected_dr_bootstrap,
+            "export_label_filter": export_label_filter,
+            "export_dr_include_unsure": bool(export_dr_include_unsure),
+            "export_dr_include_invalid": bool(export_dr_include_invalid),
+        },
         "versions": {
             "python": sys.version,
             "numpy": np.__version__,
@@ -1135,21 +1220,108 @@ def _build_export_zip(
 
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("gcFit.csv", _df_bytes(gc_fit))
-        zf.writestr("gcBoot.csv", _df_bytes(gc_boot))
-        if isinstance(dr_fit, pd.DataFrame) and not dr_fit.empty:
-            zf.writestr("drFit.csv", _df_bytes(dr_fit))
-        if isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty:
-            zf.writestr("drBoot.csv", _df_bytes(dr_boot))
+        allowed_ids: list[str] = []
+        mode_upper = str(mode_label or "").strip().upper()
+        if mode_upper == "AUTO":
+            label_candidates = ["Pred Label", "pred_label", "True Label"]
+        else:
+            label_candidates = ["True Label", "Pred Label", "pred_label"]
+        if isinstance(classifier_df, pd.DataFrame) and not classifier_df.empty and "Test Id" in classifier_df.columns:
+            label_col = next((c for c in label_candidates if c in classifier_df.columns), None)
+            if label_col is not None:
+                labels = classifier_df[label_col].map(_normalize_label)
+                f = str(export_label_filter or "Valid").strip().lower()
+                if f == "all":
+                    mask = labels.isin(["Valid", "Invalid", "Unsure"])
+                elif f == "invalid":
+                    mask = labels == "Invalid"
+                elif f == "unsure":
+                    mask = labels == "Unsure"
+                else:
+                    mask = labels == "Valid"
+                allowed_ids = classifier_df.loc[mask, "Test Id"].astype(str).drop_duplicates().tolist()
+
+        gc_fit_out = gc_fit.copy()
+        gc_boot_out = gc_boot.copy()
+        if allowed_ids and isinstance(gc_fit_out, pd.DataFrame) and not gc_fit_out.empty and "add.id" in gc_fit_out.columns:
+            gc_fit_out = gc_fit_out[gc_fit_out["add.id"].astype(str).isin(allowed_ids)].copy()
+        elif isinstance(gc_fit_out, pd.DataFrame) and not gc_fit_out.empty and "add.id" in gc_fit_out.columns:
+            gc_fit_out = gc_fit_out.iloc[0:0].copy()
+        if allowed_ids and isinstance(gc_boot_out, pd.DataFrame) and not gc_boot_out.empty and "add.id" in gc_boot_out.columns:
+            gc_boot_out = gc_boot_out[gc_boot_out["add.id"].astype(str).isin(allowed_ids)].copy()
+        elif isinstance(gc_boot_out, pd.DataFrame) and not gc_boot_out.empty and "add.id" in gc_boot_out.columns:
+            gc_boot_out = gc_boot_out.iloc[0:0].copy()
+
+        # Recompute DR export tables from selected labels:
+        # Valid is always included; optionally include Unsure/Invalid.
+        dr_fit_out = dr_fit.copy()
+        dr_boot_out = dr_boot.copy()
+        dr_allowed_ids: list[str] = []
+        if isinstance(classifier_df, pd.DataFrame) and not classifier_df.empty and "Test Id" in classifier_df.columns:
+            dr_label_col = next((c for c in label_candidates if c in classifier_df.columns), None)
+            if dr_label_col is not None:
+                _lbl = classifier_df[dr_label_col].map(_normalize_label).astype(str)
+                keep_mask = _lbl.eq("Valid")
+                if export_dr_include_unsure:
+                    keep_mask = keep_mask | _lbl.eq("Unsure")
+                if export_dr_include_invalid:
+                    keep_mask = keep_mask | _lbl.eq("Invalid")
+                dr_allowed_ids = classifier_df.loc[keep_mask, "Test Id"].astype(str).drop_duplicates().tolist()
+
+        if isinstance(grofit_tidy_all, pd.DataFrame) and not grofit_tidy_all.empty:
+            dr_curves = grofit_tidy_all
+            if dr_allowed_ids:
+                dr_curves = dr_curves[dr_curves["curve_id"].astype(str).isin(dr_allowed_ids)].copy()
+            else:
+                dr_curves = dr_curves.iloc[0:0].copy()
+            if not dr_curves.empty:
+                try:
+                    dr_res = run_grofit_pipeline(
+                        curves_df=dr_curves,
+                        response_var=grofit_opts.response_var,
+                        have_atleast=grofit_opts.have_atleast,
+                        gc_boot_B=0,
+                        dr_boot_B=grofit_opts.dr_boot_B,
+                        spline_auto_cv=grofit_opts.spline_auto_cv,
+                        spline_s=grofit_opts.spline_s,
+                        smooth_gc=grofit_opts.smooth_gc,
+                        smooth_dr=grofit_opts.smooth_dr,
+                        dr_x_transform=grofit_opts.dr_x_transform,
+                        dr_y_transform=grofit_opts.dr_y_transform,
+                        dr_s=grofit_opts.dr_s,
+                        fit_opt=grofit_opts.fit_opt,
+                        bootstrap_method=_normalize_bootstrap_method(grofit_opts.bootstrap_method),
+                        validity_col="__all__",
+                        random_state=42,
+                        export_dir=None,
+                    )
+                    dr_fit_out = dr_res.get("dr_fit", pd.DataFrame())
+                    dr_boot_out = dr_res.get("dr_boot", pd.DataFrame())
+                except Exception:
+                    dr_fit_out = pd.DataFrame()
+                    dr_boot_out = pd.DataFrame()
+            else:
+                dr_fit_out = pd.DataFrame()
+                dr_boot_out = pd.DataFrame()
+
+        zf.writestr("gcFit.csv", _df_bytes(gc_fit_out))
+        if isinstance(gc_boot_out, pd.DataFrame) and not gc_boot_out.empty:
+            zf.writestr("gcBoot.csv", _df_bytes(gc_boot_out))
+        if isinstance(dr_fit_out, pd.DataFrame) and not dr_fit_out.empty:
+            zf.writestr("drFit.csv", _df_bytes(dr_fit_out))
+        if isinstance(dr_boot_out, pd.DataFrame) and not dr_boot_out.empty:
+            zf.writestr("drBoot.csv", _df_bytes(dr_boot_out))
+        # Classifier performance metrics for thesis (if trained in this session)
+        try:
+            _perf_path = Path(MODEL_DIR) / "classifier_performance_latest.csv"
+            if _perf_path.exists():
+                zf.writestr("classifier_performance.csv", _perf_path.read_bytes())
+        except Exception:
+            pass
 
         n_plot_files = 0
 
-        valid_ids: list[str] = []
-        if isinstance(classifier_df, pd.DataFrame) and not classifier_df.empty and "Test Id" in classifier_df.columns:
-            label_col = "True Label" if "True Label" in classifier_df.columns else ("Pred Label" if "Pred Label" in classifier_df.columns else None)
-            if label_col is not None:
-                labels = classifier_df[label_col].map(_normalize_label)
-                valid_ids = classifier_df.loc[labels == "Valid", "Test Id"].astype(str).drop_duplicates().tolist()
+        valid_ids: list[str] = allowed_ids
         if valid_ids:
             fit_source_wide = proc_wide_df if isinstance(proc_wide_df, pd.DataFrame) and not proc_wide_df.empty else wide_df
             curves_tidy = (
@@ -1188,6 +1360,7 @@ def _build_export_zip(
                     labels_df=labels_for_payload,
                     gc_boot=gc_boot if isinstance(gc_boot, pd.DataFrame) else None,
                     spline_s=grofit_opts.spline_s,
+                    smooth_gc=grofit_opts.smooth_gc,
                     spline_auto_cv=grofit_opts.spline_auto_cv,
                     include_bootstrap=bool(isinstance(gc_boot, pd.DataFrame) and not gc_boot.empty),
                     test_id=file_stem,
@@ -1216,7 +1389,7 @@ def _build_export_zip(
                     zf.writestr(f"plots/{safe_tid}.html", fig.to_html(full_html=True, include_plotlyjs="cdn"))
                     n_plot_files += 1
 
-        if isinstance(dr_fit, pd.DataFrame) and not dr_fit.empty and isinstance(gc_fit, pd.DataFrame) and not gc_fit.empty:
+        if isinstance(dr_fit_out, pd.DataFrame) and not dr_fit_out.empty and isinstance(gc_fit_out, pd.DataFrame) and not gc_fit_out.empty:
             labels_for_dr = pd.DataFrame()
             if isinstance(classifier_df, pd.DataFrame) and not classifier_df.empty and "Test Id" in classifier_df.columns:
                 labels_for_dr["Test Id"] = classifier_df["Test Id"].astype(str)
@@ -1230,25 +1403,27 @@ def _build_export_zip(
                 labels_for_dr["Reviewed"] = False
 
             dr_test_id = None
-            if "name" in dr_fit.columns:
-                dr_names = dr_fit["name"].dropna().astype(str).tolist()
+            if "name" in dr_fit_out.columns:
+                dr_names = dr_fit_out["name"].dropna().astype(str).tolist()
                 dr_test_id = dr_names[0] if dr_names else None
 
             if not labels_for_dr.empty:
                 dr_payload = build_dr_payload(
-                    gc_fit=gc_fit,
+                    gc_fit=gc_fit_out,
                     labels_df=labels_for_dr,
-                    dr_boot=dr_boot if isinstance(dr_boot, pd.DataFrame) else None,
+                    dr_boot=dr_boot_out if isinstance(dr_boot_out, pd.DataFrame) else None,
                     test_id=dr_test_id,
                     response_metric=str(grofit_opts.response_var),
                     label_source="final",
-                    include_unsure=False,
-                    include_invalid=False,
+                    include_unsure=bool(export_dr_include_unsure),
+                    include_invalid=bool(export_dr_include_invalid),
                     dr_s=grofit_opts.dr_s,
+                    smooth_dr=grofit_opts.smooth_dr,
                     dr_x_transform=grofit_opts.dr_x_transform,
-                    show_bootstrap=bool(isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty),
+                    dr_y_transform=grofit_opts.dr_y_transform,
+                    show_bootstrap=bool(isinstance(dr_boot_out, pd.DataFrame) and not dr_boot_out.empty),
                 )
-                dr_fig = make_dr_plot(dr_payload, show_bootstrap=bool(isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty))
+                dr_fig = make_dr_plot(dr_payload, show_bootstrap=bool(isinstance(dr_boot_out, pd.DataFrame) and not dr_boot_out.empty))
                 zf.writestr("plots/Dose_Response.html", dr_fig.to_html(full_html=True, include_plotlyjs="cdn"))
                 n_plot_files += 1
 
@@ -1308,6 +1483,7 @@ def render_results(results: dict):
     review_df = results.get("review_df")
     manual_review_mode = results.get("manual_review_mode", False)
     grofit_opts = results.get("grofit_opts", st.session_state.get("grofit_opts", GrofitOptions()))
+    grofit_opts.bootstrap_method = _normalize_bootstrap_method(getattr(grofit_opts, "bootstrap_method", None))
     meta_df = results.get("meta_df", out_df)
 
     if review_df is not None:
@@ -1430,438 +1606,6 @@ def render_results(results: dict):
         c2.metric("Valid", valid_count)
         c3.metric("Invalid", invalid_count)
         c4.metric("Unsure", unsure_count)
-
-    # st.markdown("---")
-    # st.markdown("#### Review Section")
-
-    # top_left, top_right = st.columns([2.2, 1.0], gap="large")
-    # with top_left:
-    #     filter_col, select_col = st.columns([1, 2])
-    #     with filter_col:
-    #         filter_choice = st.selectbox("Filter", options=["All", "Valid", "Invalid", "Unsure"], key="curve_filter")
-    # with top_right:
-    #     st.markdown("", unsafe_allow_html=True)
-    # if filter_choice != "All":
-    #     filtered = curve_df[curve_df[pred_col] == filter_choice].copy()
-    # else:
-    #     filtered = curve_df.copy()
-
-    # base_order = (
-    #     wide_original["Test Id"].astype(str).tolist()
-    #     if wide_original is not None and "Test Id" in wide_original.columns
-    #     else curve_df["Test Id"].astype(str).tolist()
-    # )
-    # allowed = set(filtered["Test Id"].astype(str).tolist())
-    # options = [tid for tid in base_order if tid in allowed]
-    # if not options:
-    #     st.warning("No curves match the current filter.")
-    #     return
-
-    # pending = st.session_state.pop("pending_curve_select", None)
-    # if pending in options:
-    #     st.session_state["curve_select"] = pending
-    #     st.session_state["selected_test_id"] = pending
-
-    # if st.session_state.get("selected_test_id") not in options:
-    #     st.session_state["selected_test_id"] = options[0]
-
-    # with select_col:
-    #     current_sel = st.session_state.get("curve_select", st.session_state.get("selected_test_id"))
-    #     index_val = options.index(str(current_sel)) if str(current_sel) in options else 0
-    #     chosen = st.selectbox(
-    #         "Select Test Id + Conc",
-    #         options,
-    #         index=index_val,
-    #         key="curve_select",
-    #         format_func=_label_with_conc,
-    #     )
-
-    # st.session_state["selected_test_id"] = chosen
-
-    # def _nav_set(new_idx: int):
-    #     new_val = options[new_idx]
-    #     st.session_state["selected_test_id"] = new_val
-    #     st.session_state["pending_curve_select"] = new_val
-    #     st.rerun()
-
-    # row = curve_df.loc[curve_df["Test Id"].astype(str) == str(chosen)].iloc[0]
-    # out_row = out_df.loc[out_df["Test Id"].astype(str) == str(chosen)].iloc[0] if not out_df.empty else row
-    # pred_label = _normalize_label(row.get(pred_col, ""))
-    # if manual_review_mode:
-    #     final_label = _normalize_label(row.get("final_label", pred_label))
-    #     if not final_label:
-    #         final_label_bool = bool(row.get("is_valid_final", _label_is_valid(pred_label)))
-    #         final_label = "Valid" if final_label_bool else "Invalid"
-    # else:
-    #     final_label = pred_label
-
-    # zip_ready = bool(grofit_ran and zip_bytes)
-
-    # left, right = st.columns([2.2, 1.0], gap="small")
-    # with left:
-    #     st.markdown('<div class="curve-title">Curve Overlay</div>', unsafe_allow_html=True)
-    #     if wide_original is not None and not final_merged.empty:
-    #         raw_row = wide_original.loc[wide_original["Test Id"].astype(str) == str(chosen)]
-    #         proc_row = final_merged.loc[final_merged["Test Id"].astype(str) == str(chosen)]
-    #         if not raw_row.empty and not proc_row.empty:
-    #             fig = make_overlay_plot(
-    #                 raw_row.iloc[0],
-    #                 time_cols_original,
-    #                 proc_row.iloc[0],
-    #                 time_cols_final,
-    #                 title=f"{chosen}",
-    #                 input_is_raw=settings.input_is_raw,
-    #                 global_blank=settings.global_blank,
-    #             )
-    #             fig.update_layout(height=520)
-    #             st.plotly_chart(fig, use_container_width=True)
-    #             if manual_review_mode:
-    #                 nav_left, nav_right = st.columns(2)
-    #                 if nav_left.button("Previous Curve", key="prev_curve_overlay", use_container_width=True):
-    #                     idx = options.index(str(chosen))
-    #                     _nav_set((idx - 1) % len(options))
-    #                 if nav_right.button("Next Curve", key="next_curve_overlay", use_container_width=True):
-    #                     idx = options.index(str(chosen))
-    #                     _nav_set((idx + 1) % len(options))
-    #         else:
-    #             st.warning("Could not find curve data for overlay plot.")
-    #     else:
-    #         st.warning("No time columns found for plotting.")
-
-    #     with st.expander("How this plot is built?", expanded=False):
-    #         st.markdown(
-    #             "- Timepoints are extracted from column headers like `T1.0 (h)` and sorted numerically.\n"
-    #             "- Values come from the preprocessed table after interpolation, smoothing, and blank handling.\n"
-    #             "- Y-axis is Relative OD (normalized).\n"
-    #             "- Plot shows the model-ready curve; it should closely match the cleaned measurement trace used for prediction."
-    #         )
-    #     if manual_review_mode:
-    #         exit_left, exit_right = st.columns([1.2, 1.0])
-    #         if exit_right.button("Exit Review Mode", key="exit_review_mode", use_container_width=True):
-    #             st.session_state["show_exit_review"] = True
-    #         if st.session_state.get("show_exit_review"):
-    #             exit_c1, exit_c2 = st.columns(2)
-    #             exit_c3, exit_c4 = st.columns(2)
-    #             gc_bootstrap = exit_c1.selectbox(
-    #                 "GC Bootstrap",
-    #                 options=["None", "Only Valid Curves"],
-    #                 index=0,
-    #                 key="exit_gc_bootstrap",
-    #             )
-    #             preferred_model = exit_c2.selectbox(
-    #                 "Preferred Model",
-    #                 options=["Best Model", "Spline", "Parametric"],
-    #                 index=0,
-    #                 key="exit_preferred_model",
-    #             )
-    #             response_metric = exit_c3.selectbox(
-    #                 "Response Metric",
-    #                 options=["mu", "A", "lag", "integral"],
-    #                 index=0,
-    #                 key="exit_response_metric",
-    #             )
-    #             dr_bootstrap = exit_c4.selectbox(
-    #                 "DR Bootstrap",
-    #                 options=["True", "False"],
-    #                 index=0,
-    #                 key="exit_dr_bootstrap",
-    #             )
-    #             run_left, run_right = st.columns([1.2, 1.0])
-    #             if run_right.button("RUN", key="exit_review_run", use_container_width=True):
-    #                 with st.spinner("Preparing Grofit raw file (raw OD + final labels) and running Grofit..."):
-    #                     validity_map = review_df.set_index("Test Id")["is_valid_final"].to_dict()
-    #                     grofit_tidy_all = wide_original_to_grofit_tidy(wide_original, file_tag=file_stem)
-    #                     grofit_tidy_all["is_valid_final"] = grofit_tidy_all["curve_id"].map(validity_map).fillna(False).astype(bool)
-    #                     gc_fit = pd.DataFrame()
-    #                     dr_fit = pd.DataFrame()
-    #                     gc_boot = pd.DataFrame()
-    #                     dr_boot = pd.DataFrame()
-    #                     zip_bytes = b""
-
-    #                     preferred_fit_map = {
-    #                         "Best Model": "Both (param + spline)",
-    #                         "Spline": "Spline only",
-    #                         "Parametric": "Parametric only",
-    #                     }
-    #                     fit_opt_map = {
-    #                         "Both (param + spline)": "b",
-    #                         "Parametric only": "m",
-    #                         "Spline only": "s",
-    #                     }
-    #                     fit_mode_label = preferred_fit_map.get(preferred_model, "Both (param + spline)")
-    #                     fit_opt = fit_opt_map.get(fit_mode_label, "b")
-    #                     gc_boot_B = 0 if gc_bootstrap == "None" else grofit_opts.gc_boot_B
-    #                     dr_boot_B = grofit_opts.dr_boot_B if dr_bootstrap == "True" else 0
-
-    #                     if grofit_tidy_all["is_valid_final"].any():
-    #                         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as grofit_td:
-    #                             grofit_res = run_grofit_pipeline(
-    #                                 curves_df=grofit_tidy_all,
-    #                                 response_var=response_metric,
-    #                                 have_atleast=grofit_opts.have_atleast,
-    #                                 gc_boot_B=gc_boot_B,
-    #                                 dr_boot_B=dr_boot_B,
-    #                                 spline_auto_cv=grofit_opts.spline_auto_cv,
-    #                                 spline_s=grofit_opts.spline_s,
-    #                                 dr_x_transform=grofit_opts.dr_x_transform,
-    #                                 dr_s=grofit_opts.dr_s,
-    #                                 fit_opt=fit_opt,
-    #                                 bootstrap_method=grofit_opts.bootstrap_method,
-    #                                 random_state=42,
-    #                                 export_dir=Path(grofit_td),
-    #                             )
-    #                             gc_fit = grofit_res.get("gc_fit", pd.DataFrame())
-    #                             dr_fit = grofit_res.get("dr_fit", pd.DataFrame())
-    #                             gc_boot = grofit_res.get("gc_boot", pd.DataFrame())
-    #                             dr_boot = grofit_res.get("dr_boot", pd.DataFrame())
-    #                             zip_bytes = grofit_res.get("zip_bytes", b"")
-    #                     else:
-    #                         st.info("No valid curves found (or all valid curves had insufficient points). Skipping Grofit.")
-
-    #                 results["grofit_tidy_all"] = grofit_tidy_all
-    #                 results["gc_fit"] = gc_fit
-    #                 results["dr_fit"] = dr_fit
-    #                 results["gc_boot"] = gc_boot
-    #                 results["dr_boot"] = dr_boot
-    #                 results["zip_bytes"] = zip_bytes
-    #                 results["grofit_ran"] = True
-    #                 st.session_state["last_run_results"] = results
-    #                 st.rerun()
-
-    # with right:
-    #     total_reviewed_label = f"{reviewed_count}/{total_curves}"
-    #     correct_reviewed_label = f"{correct_count}/{reviewed_count}" if reviewed_count > 0 else "0/0"
-    #     metric_font = "1.1rem"
-    #     st.markdown('<div class="metrics-panel">', unsafe_allow_html=True)
-    #     def _fmt_val(val: object) -> str:
-    #         if val is None or (isinstance(val, float) and pd.isna(val)):
-    #             return "NA"
-    #         if isinstance(val, bool):
-    #             return "True" if val else "False"
-    #         return str(val)
-
-    #     def _fmt_metric(val: object) -> str:
-    #         if val is None or (isinstance(val, float) and pd.isna(val)):
-    #             return "NA"
-    #         if isinstance(val, (int, float, np.floating)):
-    #             return f"{float(val):.4f}"
-    #         return str(val)
-
-    #     def _render_row(label: str, value: str | None = None) -> None:
-    #         r_label, r_value = st.columns([1.2, 1.8], gap="small")
-    #         r_label.markdown(
-    #             f"<div style='font-size:{metric_font};font-weight:600;'>{label}</div>",
-    #             unsafe_allow_html=True,
-    #         )
-    #         if value is None:
-    #             r_value.markdown(f"<div style='font-size:{metric_font};'>NA</div>", unsafe_allow_html=True)
-    #         else:
-    #             r_value.markdown(
-    #                 f"<div style='font-size:{metric_font};'>{value}</div>",
-    #                 unsafe_allow_html=True,
-    #             )
-
-    #     def _render_select_row(label: str, options_list: list[str], index_val: int, key_val: str) -> str:
-    #         r_label, r_value, r_spacer = st.columns([1.2, 0.78, 1.02], gap="small")
-    #         r_label.markdown(
-    #             f"<div style='font-size:{metric_font};font-weight:600;'>{label}</div>",
-    #             unsafe_allow_html=True,
-    #         )
-    #         sel = r_value.selectbox(
-    #             label,
-    #             options=options_list,
-    #             index=index_val,
-    #             key=key_val,
-    #             label_visibility="collapsed",
-    #         )
-    #         r_spacer.markdown("")
-    #         return sel
-
-    #     if manual_review_mode:
-    #         st.markdown(
-    #             (
-    #                 "<div class='metrics-top'>"
-    #                 f"<div class='total-reviewed'>"
-    #                 f"Total Reviewed: {total_reviewed_label} | Correctly Predicted: {correct_reviewed_label}"
-    #                 "</div>"
-    #                 "</div>"
-    #                 "<div class='metrics-title'>Metrics</div>"
-    #             ),
-    #             unsafe_allow_html=True,
-    #         )
-    #     _render_row("Predicted Label", _fmt_val(pred_label))
-    #     if manual_review_mode and isinstance(review_df, pd.DataFrame) and not review_df.empty:
-    #         curve_key = row.get("CurveKey")
-    #         if not curve_key:
-    #             curve_key = _make_curve_key(str(row["Test Id"]), row.get("Concentration"))
-    #         label_key = f"final_label_{curve_key}"
-    #         reviewed_key = f"reviewed_{curve_key}"
-    #         if label_key not in st.session_state:
-    #             pred_norm = _normalize_label(pred_label)
-    #             st.session_state[label_key] = pred_norm if pred_norm in {"Valid", "Invalid", "Unsure"} else "Unsure"
-    #         if reviewed_key not in st.session_state:
-    #             st.session_state[reviewed_key] = "True" if bool(row.get("Reviewed", False)) else "False"
-    #         elif isinstance(st.session_state[reviewed_key], bool):
-    #             st.session_state[reviewed_key] = "True" if st.session_state[reviewed_key] else "False"
-
-    #         new_final = _render_select_row(
-    #             "True Label",
-    #             ["Valid", "Invalid", "Unsure"],
-    #             ["Valid", "Invalid", "Unsure"].index(st.session_state[label_key]),
-    #             label_key,
-    #         )
-    #         reviewed_val = _render_select_row(
-    #             "Reviewed",
-    #             ["False", "True"],
-    #             1 if st.session_state[reviewed_key] == "True" else 0,
-    #             reviewed_key,
-    #         )
-    #         reviewed_bool = reviewed_val == "True"
-
-    #         if new_final != _normalize_label(row.get("final_label", pred_label)) or reviewed_bool != bool(row.get("Reviewed", False)):
-    #             review_df.loc[review_df["CurveKey"] == curve_key, "final_label"] = new_final
-    #             review_df.loc[review_df["CurveKey"] == curve_key, "is_valid_final"] = (new_final == "Valid")
-    #             review_df.loc[review_df["CurveKey"] == curve_key, "Reviewed"] = reviewed_bool
-    #             st.session_state["review_df"] = review_df
-    #             st.rerun()
-    #     fit_row = None
-    #     if isinstance(gc_fit, pd.DataFrame) and not gc_fit.empty:
-    #         fit_match = gc_fit[
-    #             (gc_fit["test.id"].astype(str) == str(file_stem))
-    #             & (gc_fit["add.id"].astype(str) == str(chosen))
-    #         ]
-    #         if not fit_match.empty:
-    #             fit_row = fit_match.iloc[0]
-
-    #     boot_row = None
-    #     if isinstance(gc_boot, pd.DataFrame) and not gc_boot.empty:
-    #         boot_match = gc_boot[
-    #             (gc_boot["test.id"].astype(str) == str(file_stem))
-    #             & (gc_boot["add.id"].astype(str) == str(chosen))
-    #         ]
-    #         if not boot_match.empty:
-    #             boot_row = boot_match.iloc[0]
-
-    #     _render_row("Confidence (Valid)", _fmt_metric(out_row.get("confidence_valid", "NA")))
-    #     _render_row("mu.spline", _fmt_metric(fit_row.get("mu.spline") if fit_row is not None else None))
-    #     _render_row("Use.model", _fmt_metric(fit_row.get("use.model") if fit_row is not None else None))
-    #     _render_row("lambda.spline", _fmt_metric(fit_row.get("lambda.spline") if fit_row is not None else None))
-    #     _render_row("A.nonpara", _fmt_metric(fit_row.get("A.nonpara") if fit_row is not None else None))
-    #     _render_row("integral.spline", _fmt_metric(fit_row.get("integral.spline") if fit_row is not None else None))
-    #     _render_row("mu.model", _fmt_metric(fit_row.get("mu.model") if fit_row is not None else None))
-    #     _render_row("lambda.model", _fmt_metric(fit_row.get("lambda.model") if fit_row is not None else None))
-    #     _render_row("A.para", _fmt_metric(fit_row.get("A.para") if fit_row is not None else None))
-    #     _render_row("Integral.model", _fmt_metric(fit_row.get("Integral.model") if fit_row is not None else None))
-    #     _render_row("mu.bt", _fmt_metric(boot_row.get("mu.bt") if boot_row is not None else None))
-    #     _render_row("lambda.bt", _fmt_metric(boot_row.get("lambda.bt") if boot_row is not None else None))
-    #     _render_row("A.bt", _fmt_metric(boot_row.get("A.bt") if boot_row is not None else None))
-    #     _render_row("integral.bt", _fmt_metric(boot_row.get("integral.bt") if boot_row is not None else None))
-    #     _render_row("Too Sparse", _fmt_val(bool(out_row.get("too_sparse")) if "too_sparse" in out_row else "NA"))
-    #     _render_row("Low Resolution", _fmt_val(bool(out_row.get("low_resolution")) if "low_resolution" in out_row else "NA"))
-    #     _render_row(
-    #         "Blank subtraction mode",
-    #         _fmt_val("RAW (applied)" if settings.input_is_raw else "ALREADY BLANK SUBTRACTED (so not applied)"),
-    #     )
-    #     st.markdown("</div>", unsafe_allow_html=True)
-
-    #     st.markdown("---")
-    #     if manual_review_mode and isinstance(review_df, pd.DataFrame) and not review_df.empty:
-    #         st.markdown('<div class="review-actions">', unsafe_allow_html=True)
-    #         curve_key = row.get("CurveKey")
-    #         if not curve_key:
-    #             curve_key = _make_curve_key(str(row["Test Id"]), row.get("Concentration"))
-
-    #         review_c1, review_c2, review_c3 = st.columns(3)
-    #         # Reset button intentionally disabled.
-    #         if False:
-    #             with review_c1:
-    #                 if st.button("Reset", key=f"reset_{curve_key}", use_container_width=True):
-    #                     review_df.loc[review_df["CurveKey"] == curve_key, "is_valid_final"] = review_df.loc[
-    #                         review_df["CurveKey"] == curve_key, "is_valid_pred"
-    #                     ].astype(bool)
-    #                     review_df.loc[review_df["CurveKey"] == curve_key, "final_label"] = review_df.loc[
-    #                         review_df["CurveKey"] == curve_key, "pred_label"
-    #                     ].astype(str)
-    #                     review_df.loc[review_df["CurveKey"] == curve_key, "Reviewed"] = False
-    #                     st.session_state["review_df"] = review_df
-    #                     st.rerun()
-    #         # Show Random Curve intentionally disabled.
-    #         if False:
-    #             if review_c2.button("Show Random Curve", key="rand_curve", use_container_width=True):
-    #                 _nav_set(np.random.randint(0, len(options)))
-
-    #         st.markdown('<div class="action-buttons">', unsafe_allow_html=True)
-    #         # File uploader intentionally disabled.
-    #         if False:
-    #             b_col = st.columns(1)[0]
-    #             with b_col:
-    #                 st.markdown('<div class="upload-btn">', unsafe_allow_html=True)
-    #                 # Upload action: apply a batch of true labels to the current review set.
-    #                 review_upload = st.file_uploader(
-    #                     "Upload True Labels",                 # label hidden anyway
-    #                     type=["csv", "xlsx"],
-    #                     accept_multiple_files=False,
-    #                     key="manual_review_upload",
-    #                     label_visibility="collapsed",         # hide the label line completely
-    #                     help="Upload a file with Raw Input Data and a 'True Label' column.",
-    #                 )
-    #                 st.markdown("</div>", unsafe_allow_html=True)
-    #                 if review_upload is not None:
-    #                     last_name = st.session_state.get("manual_review_upload_name")
-    #                     if last_name != review_upload.name:
-    #                         try:
-    #                             if review_upload.name.lower().endswith(".csv"):
-    #                                 review_in = pd.read_csv(review_upload)
-    #                             else:
-    #                                 review_in = pd.read_excel(review_upload)
-    #                             cols_lower = {str(c).strip().lower(): c for c in review_in.columns}
-    #                             test_col = cols_lower.get("test id") or cols_lower.get("test_id") or cols_lower.get("testid")
-    #                             true_col = cols_lower.get("true label") or cols_lower.get("true_label") or cols_lower.get("final label") or cols_lower.get("final_label")
-    #                             conc_col = cols_lower.get("concentration") or cols_lower.get("conc")
-    #                             if not test_col or not true_col:
-    #                                 st.error("Uploaded file must contain 'Test Id' and 'True Label' columns.")
-    #                             else:
-    #                                 for _, r in review_in.iterrows():
-    #                                     tid = str(r.get(test_col, "")).strip()
-    #                                     if not tid:
-    #                                         continue
-    #                                     true_lbl = _normalize_label(r.get(true_col, ""))
-    #                                     true_bool = _label_is_valid(true_lbl)
-    #                                     if conc_col and conc_col in r and "Concentration" in review_df.columns:
-    #                                         ck = _make_curve_key(tid, r.get(conc_col))
-    #                                         mask = review_df["CurveKey"] == ck
-    #                                     else:
-    #                                         mask = review_df["Test Id"].astype(str) == tid
-    #                                     if not mask.any():
-    #                                         continue
-    #                                     if true_lbl:
-    #                                         review_df.loc[mask, "final_label"] = true_lbl
-    #                                         review_df.loc[mask, "is_valid_final"] = true_bool
-    #                                         review_df.loc[mask, "Reviewed"] = True
-    #                                     else:
-    #                                         review_df.loc[mask, "Reviewed"] = False
-    #                                         review_df.loc[mask, "final_label"] = review_df.loc[mask, "pred_label"].astype(str)
-    #                                         review_df.loc[mask, "is_valid_final"] = review_df.loc[mask, "is_valid_pred"]
-
-    #                                 st.session_state["review_df"] = review_df
-    #                                 st.session_state["manual_review_upload_name"] = review_upload.name
-    #                                 st.success("Manual review file applied.")
-    #                                 st.rerun()
-    #                         except Exception as e:
-    #                             st.error(f"Failed to process upload: {e}")
-    #         st.markdown("</div>", unsafe_allow_html=True)
-
-    #         st.markdown("</div>", unsafe_allow_html=True)
-    #     else:
-    #         nav_c1, nav_c2, nav_c3 = st.columns(3)
-    #         if nav_c1.button("Show Previous", key="prev_curve_auto"):
-    #             idx = options.index(str(chosen))
-    #             _nav_set((idx - 1) % len(options))
-    #         if nav_c2.button("Show Random Curve", key="rand_curve_auto"):
-    #             _nav_set(np.random.randint(0, len(options)))
-    #         if nav_c3.button("Show Next", key="next_curve_auto"):
-    #             idx = options.index(str(chosen))
-    #             _nav_set((idx + 1) % len(options))
 
     st.markdown("---")
     st.markdown("#### Review Section")
@@ -2056,12 +1800,12 @@ def render_results(results: dict):
         c1, c2 = st.columns(2)
         with c1:
             gc_bootstrap_targets = st.selectbox(
-                "GC Bootstrap Targets",
-                options=["None", "Only Valid Curves", "Custom List"],
-                index=["None", "Only Valid Curves", "Custom List"].index(
-                    st.session_state.get("exit_gc_bootstrap", "None")
-                    if st.session_state.get("exit_gc_bootstrap", "None") in {"None", "Only Valid Curves", "Custom List"}
-                    else "None"
+                "GC Bootstrap",
+                options=["False", "True"],
+                index=["False", "True"].index(
+                    st.session_state.get("exit_gc_bootstrap", "False")
+                    if st.session_state.get("exit_gc_bootstrap", "False") in {"False", "True"}
+                    else "False"
                 ),
             )
             response_metric = st.selectbox(
@@ -2085,11 +1829,11 @@ def render_results(results: dict):
             )
             dr_bootstrap = st.selectbox(
                 "DR Bootstrap",
-                options=["False", "True"],
-                index=["False", "True"].index(
-                    st.session_state.get("exit_dr_bootstrap", "False")
-                    if st.session_state.get("exit_dr_bootstrap", "False") in {"True", "False"}
-                    else "False"
+                options=["True", "False"],
+                index=["True", "False"].index(
+                    st.session_state.get("exit_dr_bootstrap", "True")
+                    if st.session_state.get("exit_dr_bootstrap", "True") in {"True", "False"}
+                    else "True"
                 ),
             )
         st.divider()
@@ -2116,6 +1860,7 @@ def render_results(results: dict):
             labels_df=labels_df,
             gc_boot=gc_boot,
             spline_s=grofit_opts.spline_s,
+            smooth_gc=grofit_opts.smooth_gc,
             spline_auto_cv=grofit_opts.spline_auto_cv,
             include_bootstrap=bool(isinstance(gc_boot, pd.DataFrame) and not gc_boot.empty),
             test_id=active_test_id,
@@ -2146,7 +1891,7 @@ def render_results(results: dict):
                 options=overlay_options,
                 default=["Spline Fit", "Parametric Model"],
                 selection_mode="multi",
-                key="curve_overlay_pills",
+                key=f"curve_overlay_pills_{chosen}",
             )
 
             # 3. Inject Session State Bootstrap into Payload if needed
@@ -2280,13 +2025,6 @@ def render_results(results: dict):
                         reviewed_key,
                     )
                     reviewed_bool = reviewed_val == "True"
-                    label_reason_raw = out_row.get("Label Reason", row.get("Label Reason", ""))
-                    label_reason_txt = ""
-                    if label_reason_raw is not None and not (isinstance(label_reason_raw, float) and pd.isna(label_reason_raw)):
-                        label_reason_txt = str(label_reason_raw).strip()
-                    if label_reason_txt:
-                        _render_row("Label Reason", label_reason_txt)
-
                     if new_final != _normalize_label(row.get("true_label", row.get("final_label", pred_label))) or reviewed_bool != bool(row.get("Reviewed", False)):
                         review_df.loc[review_df["CurveKey"] == curve_key, "true_label"] = new_final
                         review_df.loc[review_df["CurveKey"] == curve_key, "is_valid_true"] = (new_final == "Valid")
@@ -2315,22 +2053,6 @@ def render_results(results: dict):
                         st.session_state["last_run_results"] = results
                         st.rerun()
 
-                    st.divider()
-                    boot_ids = st.session_state.get("bootstrap_curve_ids", [])
-                    include_bootstrap = str(chosen) in boot_ids
-                    include_bootstrap_new = st.toggle(
-                        "Include in Custom Bootstrap",
-                        value=include_bootstrap,
-                        key=f"toggle_bootstrap_{chosen}",
-                    )
-                    if include_bootstrap_new != include_bootstrap:
-                        if include_bootstrap_new:
-                            boot_ids = list(dict.fromkeys([*boot_ids, str(chosen)]))
-                        else:
-                            boot_ids = [cid for cid in boot_ids if cid != str(chosen)]
-                        st.session_state["bootstrap_curve_ids"] = boot_ids
-                        st.rerun()
-
                 pred_conf_text = "" if pred_label.strip().lower() == "unsure" else _fmt_metric(pred_conf_display)
                 _render_row(f"Confidence ({pred_label})", pred_conf_text)
 
@@ -2339,24 +2061,6 @@ def render_results(results: dict):
                 parametric = curve_payload.get("parametric", {})
                 param_params = parametric.get("params", {})
                 boot_ci = curve_payload.get("bootstrap", {}).get("ci", {})
-                has_boot_vals = boot_row is not None and any(
-                    pd.notna(boot_row.get(k, np.nan)) for k in ["mu.bt", "lambda.bt", "A.bt", "integral.bt"]
-                )
-                has_boot_ci = any(
-                    isinstance(boot_ci.get(k), (list, tuple)) and len(boot_ci.get(k)) >= 2
-                    for k in ["mu", "lambda", "A", "integral"]
-                )
-
-                def _fmt_boot_metric(metric_key: str, mean_key: str) -> str:
-                    ci = boot_ci.get(metric_key)
-                    if isinstance(ci, (list, tuple)) and len(ci) >= 2:
-                        lo = pd.to_numeric(pd.Series([ci[0]]), errors="coerce").iloc[0]
-                        hi = pd.to_numeric(pd.Series([ci[1]]), errors="coerce").iloc[0]
-                        if np.isfinite(lo) and np.isfinite(hi):
-                            return f"[{float(lo):.4f}, {float(hi):.4f}]"
-                    if boot_row is not None:
-                        return _fmt_metric(boot_row.get(mean_key))
-                    return "NA"
 
                 metric_rows = [
                     {"Metric": "mu", "Spline": _fmt_ci_metric(spline_params.get("mu"), boot_ci.get("mu")), "Model": _fmt_metric(param_params.get("mu"))},
@@ -2364,11 +2068,6 @@ def render_results(results: dict):
                     {"Metric": "A", "Spline": _fmt_ci_metric(spline_params.get("A"), boot_ci.get("A")), "Model": _fmt_metric(param_params.get("A"))},
                     {"Metric": "Integral", "Spline": _fmt_ci_metric(spline_params.get("integral"), boot_ci.get("integral")), "Model": _fmt_metric(param_params.get("integral"))},
                 ]
-                if has_boot_vals or has_boot_ci:
-                    metric_rows[0]["Bootstrap"] = _fmt_boot_metric("mu", "mu.bt")
-                    metric_rows[1]["Bootstrap"] = _fmt_boot_metric("lambda", "lambda.bt")
-                    metric_rows[2]["Bootstrap"] = _fmt_boot_metric("A", "A.bt")
-                    metric_rows[3]["Bootstrap"] = _fmt_boot_metric("integral", "integral.bt")
                 params_df = pd.DataFrame(metric_rows).rename(columns={"Model": str(parametric.get("model_name") or "Model")})
                 st.dataframe(params_df, hide_index=True, use_container_width=True)
             if manual_review_mode and st.button("Run Final Pipeline & Export", type="primary", use_container_width=True, key="run_pipeline_dialog_btn"):
@@ -2401,48 +2100,65 @@ def render_results(results: dict):
                 disabled=not zip_ready,
                 use_container_width=True,
                 help="This contains gc_fit, gc_boot, dr_fit, dr_boot, and a plots folder")
-            has_gc_audit = isinstance(gc_audit, pd.DataFrame) and not gc_audit.empty
-            has_dr_audit = isinstance(dr_audit, pd.DataFrame) and not dr_audit.empty
-            if has_gc_audit and has_dr_audit:
-                audit_run_info = {
-                    "mode": "MANUAL" if manual_review_mode else "AUTO",
-                    "timestamp": datetime.now().isoformat(),
-                    "file_stem": file_stem,
-                    "predicting_model": predicting_model,
-                    "grofit_options": grofit_opts.__dict__ if grofit_opts is not None else None,
-                    "settings": settings.__dict__ if settings is not None else None,
-                    "stage2_thresholds": results.get("stage2_config"),
-                    "versions": {
-                        "python": sys.version,
-                        "numpy": np.__version__,
-                        "pandas": pd.__version__,
-                        "sklearn": sklearn.__version__,
-                    },
-                }
-                audit_zip_bio = io.BytesIO()
-                with zipfile.ZipFile(audit_zip_bio, "w", compression=zipfile.ZIP_DEFLATED) as az:
-                    az.writestr("Classifier Audit.csv", audit_df.to_csv(index=False))
+            audit_run_info = {
+                "mode": "MANUAL" if manual_review_mode else "AUTO",
+                "timestamp": datetime.now().isoformat(),
+                "file_stem": file_stem,
+                "predicting_model": predicting_model,
+                "grofit_options": grofit_opts.__dict__ if grofit_opts is not None else None,
+                "settings": settings.__dict__ if settings is not None else None,
+                "pipeline_filters": {
+                    "gc_bootstrap": (
+                        st.session_state.get("exit_gc_bootstrap", "False")
+                        if manual_review_mode
+                        else st.session_state.get("auto_bootstrap_scope", "False")
+                    ),
+                    "preferred_fit": (
+                        st.session_state.get("exit_preferred_model", "Best Model")
+                        if manual_review_mode
+                        else st.session_state.get("auto_preferred_model", "Best Model")
+                    ),
+                    "response_metric": (
+                        st.session_state.get("exit_response_metric", "mu")
+                        if manual_review_mode
+                        else st.session_state.get("auto_response_metric", "mu")
+                    ),
+                    "dr_bootstrap": (
+                        st.session_state.get("exit_dr_bootstrap", "False")
+                        if manual_review_mode
+                        else st.session_state.get("auto_dr_bootstrap", "False")
+                    ),
+                    "export_label_filter": results.get("export_label_filter", "Valid"),
+                    "export_dr_include_unsure": bool(results.get("export_dr_include_unsure", False)),
+                    "export_dr_include_invalid": bool(results.get("export_dr_include_invalid", False)),
+                },
+                "stage2_thresholds": results.get("stage2_config"),
+                "versions": {
+                    "python": sys.version,
+                    "numpy": np.__version__,
+                    "pandas": pd.__version__,
+                    "sklearn": sklearn.__version__,
+                },
+            }
+            audit_zip_bio = io.BytesIO()
+            with zipfile.ZipFile(audit_zip_bio, "w", compression=zipfile.ZIP_DEFLATED) as az:
+                az.writestr("Classifier Audit.csv", audit_df.to_csv(index=False))
+                if isinstance(gc_audit, pd.DataFrame) and not gc_audit.empty:
                     az.writestr("GC Audit.csv", gc_audit.to_csv(index=False))
+                if isinstance(dr_audit, pd.DataFrame) and not dr_audit.empty:
                     az.writestr("DR Audit.csv", dr_audit.to_csv(index=False))
-                    if isinstance(grofit_df, pd.DataFrame) and not grofit_df.empty:
-                        az.writestr("Grofit.csv", grofit_df.to_csv(index=False))
-                    az.writestr("run_info.json", json.dumps(audit_run_info, indent=2))
-                st.download_button(
-                    "Download Auditing.zip",
-                    data=audit_zip_bio.getvalue(),
-                    file_name="Auditing.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                    help="This contains auditing files for the classifier, GC fits, and DR fits for verification and debugging.",
-                )
-            else:
-                st.download_button(
-                    "Download Classifier Auditing.csv",
-                    data=audit_df.to_csv(index=False).encode("utf-8"),
-                    file_name="Classifier Auditing.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
+                if isinstance(grofit_df, pd.DataFrame) and not grofit_df.empty:
+                    grofit_out = grofit_df.drop(columns=["FileName", "Model Name", "Is_Valid"], errors="ignore")
+                    az.writestr("Grofit.csv", grofit_out.to_csv(index=False))
+                az.writestr("run_info.json", json.dumps(audit_run_info, indent=2))
+            st.download_button(
+                "Download Auditing.zip",
+                data=audit_zip_bio.getvalue(),
+                file_name="Auditing.zip",
+                mime="application/zip",
+                use_container_width=True,
+                help="Contains classifier audit, optional GC/DR audits, and run metadata.",
+            )
 
     with tab_dr:
         dr_available = isinstance(dr_fit, pd.DataFrame) and not dr_fit.empty
@@ -2456,7 +2172,7 @@ def render_results(results: dict):
                 with st.container(border=True):
                     st.markdown("**Filters**")
                     response_metric = st.selectbox(
-                        "Metric to evaluate",
+                        "Metric to display",
                         options=["mu", "A", "lambda", "integral"],
                         index=0,
                         key="dr_metric_tab",
@@ -2481,6 +2197,11 @@ def render_results(results: dict):
                     include_unsure = f_col1.checkbox("Include 'Unsure' Curves ⚠️ ", value=False, key="dr_inc_unsure_tab")
                     include_invalid = f_col2.checkbox("Include 'Invalid' Curves ⚠️ ", value=False, key="dr_inc_invalid_tab")
 
+                dr_pill_key = f"dr_overlay_pills_tab_{chosen}"
+                dr_bootstrap_selected = bool(
+                    manual_review_mode and ("Bootstrap CI" in st.session_state.get(dr_pill_key, []))
+                )
+
                 tab_dr_payload = build_dr_payload(
                     gc_fit=gc_fit,
                     labels_df=labels_df,
@@ -2491,8 +2212,16 @@ def render_results(results: dict):
                     include_unsure=include_unsure,
                     include_invalid=include_invalid,
                     dr_s=grofit_opts.dr_s,
+                    smooth_dr=grofit_opts.smooth_dr,
                     dr_x_transform=grofit_opts.dr_x_transform,
-                    show_bootstrap=True,
+                    dr_y_transform=grofit_opts.dr_y_transform,
+                    # Compute bootstrap payload when either:
+                    # 1) MANUAL pill requests a band, or
+                    # 2) drBoot exists (to populate CI metrics).
+                    show_bootstrap=bool(
+                        dr_bootstrap_selected
+                        or (isinstance(dr_boot, pd.DataFrame) and not dr_boot.empty)
+                    ),
                 )
 
                 fit_payload = tab_dr_payload.get("fit", {})
@@ -2506,6 +2235,26 @@ def render_results(results: dict):
                 ec50_hi = _to_numeric_scalar(ec50_ci[1]) if ec50_ci and len(ec50_ci) == 2 else np.nan
                 n_points = int(tab_dr_payload.get("n_points", 0))
                 excluded = int(tab_dr_payload.get("excluded", 0))
+                ci_na_reason = ""
+                if not (np.isfinite(ec50_lo) and np.isfinite(ec50_hi)):
+                    dr_boot_toggle_on = (
+                        str(st.session_state.get("exit_dr_bootstrap", "False")).strip().lower() == "true"
+                        if manual_review_mode
+                        else str(st.session_state.get("auto_dr_bootstrap", "False")).strip().lower() == "true"
+                    )
+                    min_points_req = max(6, int(grofit_opts.have_atleast))
+                    if not dr_boot_toggle_on:
+                        ci_na_reason = "DR bootstrap disabled"
+                    elif n_points < min_points_req:
+                        ci_na_reason = f"insufficient points (< {min_points_req})"
+                    elif not isinstance(dr_boot, pd.DataFrame) or dr_boot.empty or "name" not in dr_boot.columns:
+                        ci_na_reason = "no matching drBoot row"
+                    else:
+                        _m = dr_boot["name"].astype(str) == str(file_stem)
+                        if int(_m.sum()) == 0:
+                            ci_na_reason = "no matching drBoot row"
+                        else:
+                            ci_na_reason = "EC50 CI missing in drBoot row"
 
                 with st.container(border=True):
                     st.markdown("**Results**")
@@ -2514,11 +2263,18 @@ def render_results(results: dict):
                         "95% CI",
                         f"{ec50_lo:.4g} - {ec50_hi:.4g}" if np.isfinite(ec50_lo) and np.isfinite(ec50_hi) else "NA",
                     )
-                    st.metric("Mid-Point Response", f"{y_mid:.4g}" if np.isfinite(y_mid) else "NA")
+                    if ci_na_reason:
+                        st.caption(f"95% CI status: {ci_na_reason}")
                     if dr_method:
                         st.markdown(f"**Fit Method:** `{dr_method}`")
                     if ec50_status:
                         st.markdown(f"**EC50 Status:** `{ec50_status}`")
+                    x_tf = str(grofit_opts.dr_x_transform or "OFF")
+                    y_tf = str(grofit_opts.dr_y_transform or "OFF")
+                    st.caption(
+                        f"Axis transforms: X = `{x_tf}`, Y = `{y_tf}`. "
+                        "Transforms reshape the fitted DR curve; EC50 is reported back in original concentration units."
+                    )
                     st.divider()
                     st.metric("Points Used", n_points)
                     if excluded > 0:
@@ -2531,8 +2287,8 @@ def render_results(results: dict):
                         "",
                         ["Bootstrap CI"],
                         selection_mode="multi",
-                        default=["Bootstrap CI"] if boot.get("ran") else [],
-                        key="dr_overlay_pills_tab",
+                        default=st.session_state.get(dr_pill_key, []),
+                        key=dr_pill_key,
                     )
                     show_dr_bootstrap = "Bootstrap CI" in show_dr_boot
                 else:
@@ -2544,7 +2300,7 @@ def render_results(results: dict):
     if st.session_state.get("trigger_grofit_run"):
         st.session_state["trigger_grofit_run"] = False
         if manual_review_mode:
-            gc_bootstrap = st.session_state.get("exit_gc_bootstrap", "None")
+            gc_bootstrap = st.session_state.get("exit_gc_bootstrap", "False")
             preferred_model = st.session_state.get("exit_preferred_model", "Best Model")
             response_metric = st.session_state.get("exit_response_metric", "mu")
             dr_bootstrap = st.session_state.get("exit_dr_bootstrap", "True")
@@ -2577,9 +2333,17 @@ def render_results(results: dict):
                 fit_mode_label = preferred_fit_map.get(preferred_model, "Both (param + spline)")
                 fit_opt = fit_opt_map.get(fit_mode_label, "b")
 
-                gc_boot_B = 0 if gc_bootstrap == "None" else grofit_opts.gc_boot_B
+                gc_boot_B = 0 if gc_bootstrap == "False" else grofit_opts.gc_boot_B
                 dr_boot_B = grofit_opts.dr_boot_B if dr_bootstrap == "True" else 0
                 validity_col = "__all__"
+                grofit_opts_effective = GrofitOptions(**grofit_opts.__dict__)
+                grofit_opts_effective.response_var = response_metric
+                grofit_opts_effective.fit_opt = fit_opt
+                grofit_opts_effective.gc_boot_B = int(gc_boot_B)
+                grofit_opts_effective.dr_boot_B = int(dr_boot_B)
+                grofit_opts_effective.bootstrap_method = _normalize_bootstrap_method(
+                    grofit_opts_effective.bootstrap_method
+                )
 
                 gc_fit = pd.DataFrame()
                 dr_fit = pd.DataFrame()
@@ -2590,10 +2354,7 @@ def render_results(results: dict):
                 zip_bytes = b""
                 zip_name = ""
 
-                boot_list = st.session_state.get("bootstrap_curve_ids", [])
-                grofit_tidy_all_all = grofit_tidy_all.copy()
-                grofit_tidy_all_all["is_valid_true"] = True
-                curves_for_run = grofit_tidy_all_all if (gc_bootstrap == "Custom List" and boot_list) else grofit_tidy_all
+                curves_for_run = grofit_tidy_all
 
                 if not grofit_tidy_all.empty:
                     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as grofit_td:
@@ -2605,10 +2366,13 @@ def render_results(results: dict):
                             dr_boot_B=dr_boot_B,
                             spline_auto_cv=grofit_opts.spline_auto_cv,
                             spline_s=grofit_opts.spline_s,
+                            smooth_gc=grofit_opts.smooth_gc,
+                            smooth_dr=grofit_opts.smooth_dr,
                             dr_x_transform=grofit_opts.dr_x_transform,
+                            dr_y_transform=grofit_opts.dr_y_transform,
                             dr_s=grofit_opts.dr_s,
                             fit_opt=fit_opt,
-                            bootstrap_method=grofit_opts.bootstrap_method,
+                            bootstrap_method=_normalize_bootstrap_method(grofit_opts.bootstrap_method),
                             validity_col=validity_col,
                             random_state=42,
                             export_dir=Path(grofit_td),
@@ -2628,21 +2392,27 @@ def render_results(results: dict):
                             dr_fit=dr_fit,
                             dr_boot=dr_boot,
                             proc_wide_df=final_merged,
-                            grofit_opts=grofit_opts,
+                            grofit_opts=grofit_opts_effective,
                             settings=settings,
                             mode_label="MANUAL",
                             file_stem=file_stem,
                             predicting_model=predicting_model,
+                            selected_gc_bootstrap=str(gc_bootstrap),
+                            selected_preferred_fit=str(preferred_model),
+                            selected_response_metric=str(response_metric),
+                            selected_dr_bootstrap=str(dr_bootstrap),
+                            export_label_filter=results.get("export_label_filter", "Valid"),
+                            export_dr_include_unsure=bool(results.get("export_dr_include_unsure", False)),
+                            export_dr_include_invalid=bool(results.get("export_dr_include_invalid", False)),
                             audit_df=results.get("audit_df"),
                             grofit_df=results.get("grofit_df"),
                             grofit_tidy_all=grofit_tidy_all,
                             stage2_config=results.get("stage2_config"),
                         )
 
-                if gc_bootstrap == "Custom List" and boot_list and not gc_boot.empty:
-                    gc_boot = gc_boot[gc_boot["add.id"].astype(str).isin(boot_list)].copy()
-
             results["grofit_tidy_all"] = grofit_tidy_all
+            # Persist effective runtime options so run_info/audit reflects what was executed.
+            results["grofit_opts"] = grofit_opts_effective
             results["gc_fit"] = gc_fit
             results["dr_fit"] = dr_fit
             results["gc_boot"] = gc_boot
@@ -3049,7 +2819,7 @@ with top_left:
         auto_mode = mode == "Auto Mode"
         manual_review_mode = mode == "Manual Mode"
 
-        auto_bootstrap_scope = "Only Valid Curves"
+        auto_bootstrap_scope = "False"
         auto_preferred_model = "Best Model"
         auto_response_metric = "mu"
         auto_dr_bootstrap = "True"
@@ -3058,8 +2828,8 @@ with top_left:
             auto_c1, auto_c2, auto_c3, auto_c4 = st.columns(4)
             with auto_c1:
                 auto_bootstrap_scope = st.selectbox(
-                    "GC Bootstrap Targets",
-                    options=["All Curves", "Only Valid Curves", "None"],
+                    "GC Bootstrap",
+                    options=["False", "True"],
                     index=0,
                     key="auto_bootstrap_scope",
                 )
@@ -3084,8 +2854,9 @@ with top_left:
                     index=0,
                     key="auto_dr_bootstrap",
                 )
+                	
 
-        with st.expander("Filter & Pipeline Options", expanded=False):
+        with st.expander("Filter Options for Pipeline & Export", expanded=False):
             response_var = auto_response_metric if auto_mode else "mu"
 
             # Model Selection (Stage 1 Classifier)
@@ -3152,8 +2923,76 @@ with top_left:
                     help="Number of resamples for dose-response confidence intervals.",
                 )
 
-            dr_x_transform = st.selectbox("Dose-Response X-Axis Transform", options=["OFF","log10", "log1p"], index=0)
+            # dr_x_transform = st.selectbox("Dose-Response X-Axis Transform", options=["OFF","log10", "log1p"], index=0)
+            c3, c4 = st.columns(2)
+            with c3:
+                 dr_x_transform = st.selectbox(
+                    "Dose-Response X-Axis Transform",
+                    options=["OFF", "log10", "log1p"],
+                    index=0,
+                    help="Transform applied to concentration axis for DR fit/plots.",
+                 )
+            with c4:
+                dr_y_transform = st.selectbox(
+                    "Dose-Response Y-Axis Transform",
+                    options=["OFF", "log10", "log1p"],
+                    index=0,
+                    help="Transform applied to response metric axis for DR fit/plots.",
+                )
+            export_label_filter = st.selectbox(
+                "Export Curve Labels",
+                options=["Valid", "Invalid", "Unsure", "All"],
+                index=0,
+                help="Filter which curve labels are exported into Results.zip.",
+            )
+            _exp_label_norm = str(export_label_filter).strip().lower()
+            dr_unsure_enabled = _exp_label_norm in {"all", "unsure"}
+            dr_invalid_enabled = _exp_label_norm in {"all", "invalid"}
+            if not dr_unsure_enabled:
+                st.session_state["export_dr_include_unsure"] = False
+            if not dr_invalid_enabled:
+                st.session_state["export_dr_include_invalid"] = False
+            export_dr_c1, export_dr_c2 = st.columns(2)
+            with export_dr_c1:
+                export_dr_include_unsure = st.checkbox(
+                    "DR Export: Include Unsure",
+                    value=bool(st.session_state.get("export_dr_include_unsure", False)),
+                    key="export_dr_include_unsure",
+                    disabled=not dr_unsure_enabled,
+                )
+            with export_dr_c2:
+                export_dr_include_invalid = st.checkbox(
+                    "DR Export: Include Invalid",
+                    value=bool(st.session_state.get("export_dr_include_invalid", False)),
+                    key="export_dr_include_invalid",
+                    disabled=not dr_invalid_enabled,
+                )
 
+            st.markdown("**Advanced (Parity / Debug)**")
+            override_smoothing = st.checkbox(
+                "Override smoothing (smooth.gc / smooth.dr)",
+                value=False,
+                help="Default is AUTO (recommended). Changing these affects fitted parameters and parity.",
+            )
+            smooth_c1, smooth_c2 = st.columns(2)
+            with smooth_c1:
+                smooth_gc = st.number_input(
+                    "smooth.gc (GC spline smoothing)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.1,
+                    disabled=not override_smoothing,
+                    help="Only used when override is ON. Keep OFF for automated pipeline.",
+                )
+            with smooth_c2:
+                smooth_dr = st.number_input(
+                    "smooth.dr (DR spline smoothing)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.1,
+                    disabled=not override_smoothing,
+                    help="Only used when override is ON. Keep OFF for automated pipeline.",
+                )
             # Hardcoded Mathematical Defaults (Hidden from Biologists to prevent errors)
             preferred_fit_map = {
                 "Best Model": "b",
@@ -3168,12 +3007,19 @@ with top_left:
                 fit_opt=preferred_fit_map.get(auto_preferred_model if auto_mode else "Best Model", "b"),
                 gc_boot_B=int(gc_boot_B),
                 dr_boot_B=dr_boot_B_effective,
-                spline_auto_cv=True,
-                spline_s=None,  # Mathematically forced to GCV in backend
-                dr_s=None,  # Mathematically forced to DR constraints in backend
-                dr_x_transform=None if dr_x_transform == "none" else dr_x_transform,
-                bootstrap_method="residual",  # Standardized for splines
+                # spline_auto_cv=True,
+                # spline_s=None,  # Mathematically forced to GCV in backend
+                # dr_s=None,  # Mathematically forced to DR constraints in backend
+                # dr_x_transform=None if dr_x_transform == "none" else dr_x_transform,
+                spline_auto_cv=(not override_smoothing),
+                spline_s=(None if (not override_smoothing) else float(smooth_gc) if float(smooth_gc) > 0 else None),
+                smooth_gc=(None if (not override_smoothing) else float(smooth_gc) if float(smooth_gc) > 0 else None),
+                dr_s=(None if (not override_smoothing) else float(smooth_dr) if float(smooth_dr) > 0 else None),
+                smooth_dr=(None if (not override_smoothing) else float(smooth_dr) if float(smooth_dr) > 0 else None),
+                dr_x_transform=None if dr_x_transform == "OFF" else dr_x_transform,
+                dr_y_transform=None if dr_y_transform == "OFF" else dr_y_transform,
             )
+            grofit_opts.bootstrap_method = _normalize_bootstrap_method(grofit_opts.bootstrap_method)
         st.session_state["grofit_opts"] = grofit_opts
         settings = InferenceSettings(
             input_is_raw=bool(input_is_raw),
@@ -3349,10 +3195,13 @@ if run:
                                 dr_boot_B=0,
                                 spline_auto_cv=grofit_opts.spline_auto_cv,
                                 spline_s=grofit_opts.spline_s,
+                                smooth_gc=grofit_opts.smooth_gc,
+                                smooth_dr=grofit_opts.smooth_dr,
                                 dr_x_transform=grofit_opts.dr_x_transform,
+                                dr_y_transform=grofit_opts.dr_y_transform,
                                 dr_s=grofit_opts.dr_s,
                                 fit_opt=grofit_opts.fit_opt,
-                                bootstrap_method=grofit_opts.bootstrap_method,
+                                bootstrap_method=_normalize_bootstrap_method(grofit_opts.bootstrap_method),
                                 validity_col="__all__",
                                 random_state=42,
                                 export_dir=Path(grofit_td),
@@ -3369,17 +3218,16 @@ if run:
             else:
                 st.info("Auto Mode: running Grofit pipeline with bootstrap and dose-response settings.")
                 bootstrap_curve_scope = auto_bootstrap_scope if auto_mode else "Only Valid Curves"
-                label_map = audit_df.set_index("Test Id")["True Label"].astype(str).str.strip().str.lower().to_dict()
-                include_default = grofit_tidy_all["curve_id"].astype(str).map(
-                    lambda cid: label_map.get(cid, "") in {"valid", "unsure"}
+                gc_boot_B_auto = 0 if str(bootstrap_curve_scope) == "False" else int(grofit_opts.gc_boot_B)
+                grofit_opts_effective_auto = GrofitOptions(**grofit_opts.__dict__)
+                grofit_opts_effective_auto.gc_boot_B = int(gc_boot_B_auto)
+                grofit_opts_effective_auto.bootstrap_method = _normalize_bootstrap_method(
+                    grofit_opts_effective_auto.bootstrap_method
                 )
-                include_valid_only = grofit_tidy_all["curve_id"].astype(str).map(
-                    lambda cid: label_map.get(cid, "") in {"valid"}
-                )
-                grofit_tidy_all["include_auto_default"] = include_default.fillna(False).astype(bool)
-                grofit_tidy_all["include_auto_valid_only"] = include_valid_only.fillna(False).astype(bool)
-                validity_col = "include_auto_valid_only" if bootstrap_curve_scope == "Only Valid Curves" else "include_auto_default"
-                run_grofit = (not grofit_tidy_all.empty) and grofit_tidy_all[validity_col].any()
+                # Restore previous behavior: in AUTO mode, run Grofit whenever curves exist.
+                # Curve-level reliability/point checks are handled inside Grofit pipeline.
+                validity_col = "__all__"
+                run_grofit = not grofit_tidy_all.empty
 
                 if run_grofit:
                     st.info(
@@ -3391,16 +3239,19 @@ if run:
                         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as grofit_td:
                             grofit_res = run_grofit_pipeline(
                                 curves_df=grofit_tidy_all,
-                                response_var=grofit_opts.response_var,
-                                have_atleast=grofit_opts.have_atleast,
-                                gc_boot_B=grofit_opts.gc_boot_B,
-                                dr_boot_B=grofit_opts.dr_boot_B,
-                                spline_auto_cv=grofit_opts.spline_auto_cv,
-                                spline_s=grofit_opts.spline_s,
-                                dr_x_transform=grofit_opts.dr_x_transform,
-                                dr_s=grofit_opts.dr_s,
-                                fit_opt=grofit_opts.fit_opt,
-                                bootstrap_method=grofit_opts.bootstrap_method,
+                                response_var=grofit_opts_effective_auto.response_var,
+                                have_atleast=grofit_opts_effective_auto.have_atleast,
+                                gc_boot_B=grofit_opts_effective_auto.gc_boot_B,
+                                dr_boot_B=grofit_opts_effective_auto.dr_boot_B,
+                                spline_auto_cv=grofit_opts_effective_auto.spline_auto_cv,
+                                spline_s=grofit_opts_effective_auto.spline_s,
+                                smooth_gc=grofit_opts_effective_auto.smooth_gc,
+                                smooth_dr=grofit_opts_effective_auto.smooth_dr,
+                                dr_x_transform=grofit_opts_effective_auto.dr_x_transform,
+                                dr_y_transform=grofit_opts_effective_auto.dr_y_transform,
+                                dr_s=grofit_opts_effective_auto.dr_s,
+                                fit_opt=grofit_opts_effective_auto.fit_opt,
+                                bootstrap_method=grofit_opts_effective_auto.bootstrap_method,
                                 validity_col=validity_col,
                                 random_state=42,
                                 export_dir=Path(grofit_td),
@@ -3422,7 +3273,7 @@ if run:
                                 proc_wide_df=final_merged,
                                 audit_df=audit_df,
                                 grofit_df=grofit_df,
-                                grofit_opts=grofit_opts,
+                                grofit_opts=grofit_opts_effective_auto,
                                 settings=settings,
                                 mode_label="AUTO",
                                 file_stem=file_tag,
@@ -3431,14 +3282,18 @@ if run:
                                 auto_preferred_model=auto_preferred_model,
                                 auto_response_metric=auto_response_metric,
                                 auto_dr_bootstrap=auto_dr_bootstrap,
+                                selected_gc_bootstrap=str(auto_bootstrap_scope),
+                                selected_preferred_fit=str(auto_preferred_model),
+                                selected_response_metric=str(auto_response_metric),
+                                selected_dr_bootstrap=str(auto_dr_bootstrap),
+                                export_label_filter=export_label_filter,
+                                export_dr_include_unsure=bool(export_dr_include_unsure),
+                                export_dr_include_invalid=bool(export_dr_include_invalid),
                                 stage2_config=infer_res.get("stage2_config"),
                                 grofit_tidy_all=grofit_tidy_all,
                             )
                 else:
-                    if use_all_curves:
-                        st.info("No curves found to run Grofit. Skipping Grofit.")
-                    else:
-                        st.info("No valid curves found (or all valid curves had insufficient points). Skipping Grofit.")
+                    st.info("No valid curves found (or all valid curves had insufficient points). Skipping Grofit.")
                 grofit_ran = True
                 if not run_grofit:
                     zip_name = ""
@@ -3467,9 +3322,16 @@ if run:
                 "zip_bytes": zip_bytes,
                 "zip_name": zip_name if "zip_name" in locals() else "",
                 "review_df": review_df,
-                "grofit_opts": grofit_opts,
+                "grofit_opts": (
+                    grofit_opts_effective_auto
+                    if (not manual_review_mode and "grofit_opts_effective_auto" in locals())
+                    else grofit_opts
+                ),
                 "manual_review_mode": manual_review_mode,
                 "grofit_ran": grofit_ran,
+                "export_label_filter": export_label_filter,
+                "export_dr_include_unsure": bool(export_dr_include_unsure),
+                "export_dr_include_invalid": bool(export_dr_include_invalid),
             }
             # default curve selection to first Test Id
             if not out_df.empty:
@@ -3488,4 +3350,3 @@ if not run and results:
             render_results(results)
     except Exception as e:
         show_friendly_error(e)
-

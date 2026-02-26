@@ -20,7 +20,6 @@ def gc_boot_spline(
     df: Optional[float] = None,           # NEW item 1: target df
     auto_cv: bool = True,
     bootstrap_method: BootstrapMethod = "pairs",
-
 ) -> Dict[str, Any]:
     """
     Bootstrap spline parameters A, mu, lag, integral.

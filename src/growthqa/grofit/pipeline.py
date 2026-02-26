@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional, Dict, Any, Literal
 from pathlib import Path
+import json
 
 from .gc_fit_model import gc_fit_model
 from .gc_fit_spline import gc_fit_spline
@@ -231,7 +232,10 @@ def run_grofit_pipeline(
     dr_boot_B: int = 300,
     spline_auto_cv: bool = True,
     spline_s: Optional[float] = None,
-    dr_x_transform: Optional[str] = "log10",
+    smooth_gc: Optional[float] = None,          # NEW: Grofit-like smooth.gc spar ∈ (0,1]
+    smooth_dr: Optional[float] = None,          
+    dr_x_transform: Optional[str] = None,
+    dr_y_transform: Optional[str] = None,
     dr_s: Optional[float] = None,
     random_state: Optional[int] = 42,
     fit_opt: FitOpt = "b",
@@ -307,7 +311,10 @@ def run_grofit_pipeline(
             if fit_opt in {"m", "b"}:
                 pfit = gc_fit_model(t, y)
             if fit_opt in {"s", "b"}:
-                sfit = gc_fit_spline(t, y, lam=spline_s, auto_cv=spline_auto_cv)
+                sfit = gc_fit_spline(t, y, lam=spline_s, 
+                                     auto_cv=(spline_auto_cv and spline_s is None and smooth_gc is None),
+                                     smooth=smooth_gc 
+                                     )
             if gc_boot_B > 0 and fit_opt in {"s", "b"}:
                 boot = gc_boot_spline(
                     t, y,
@@ -318,7 +325,8 @@ def run_grofit_pipeline(
                         else random_state + int(hash(curve_id) % 10_000)
                     ),
                     spline_s=spline_s,
-                    auto_cv=spline_auto_cv,
+                    auto_cv=(spline_auto_cv and spline_s is None and smooth_gc is None),
+                    smooth=smooth_gc,
                     bootstrap_method=bootstrap_method,
                 )
 
@@ -488,6 +496,7 @@ def run_grofit_pipeline(
     dr_boot_rows:  list[dict] = []
     dr_audit_rows: list[dict] = []
     log_x = 1 if str(dr_x_transform).strip().lower() in {"log1p", "log", "log10"} else 0
+    log_y_dr = 1 if str(dr_y_transform or "").strip().lower() in {"log1p", "ln1p"} else 0
     metric = str(response_var)
     for test_id in curve_index["test_id"].drop_duplicates():
         g = dr_source[dr_source["test.id"] == test_id].copy()
@@ -546,16 +555,29 @@ def run_grofit_pipeline(
         conc_arr = gg["concentration"].to_numpy(dtype=float)
         resp_arr = gg[resp_col].to_numpy(dtype=float)
 
+        log_y = 0
+        resp_for_fit = resp_arr
+        if (dr_y_transform or "").lower() in {"log1p", "ln1p"}:
+            if np.nanmin(resp_arr) < -1.0:
+                dr_rows.append(_dr_failed("dr_y_transform_invalid_lt_minus1", n_conc=n_conc))
+                continue
+            resp_for_fit = np.log1p(resp_arr)
+            log_y = 1
+
+
         spline_fit = dr_fit_spline(
-            conc_arr, resp_arr,
+            conc_arr, resp_for_fit,
             x_transform=dr_x_transform,
             lam=dr_s,
-            auto_cv=(dr_s is None),
+            # auto_cv=(dr_s is None),
+            smooth=smooth_dr,
+            y_transform=("log1p" if log_y == 1 else None),
+            auto_cv=(dr_s is None and smooth_dr is None),
             enforce_monotonic=True,
             fallback_to_4pl=(dr_fit_method != "spline"),
         )
         model_fit = (
-            dr_fit_model(conc_arr, resp_arr)
+            dr_fit_model(conc_arr, resp_for_fit)
             if dr_fit_method in {"auto", "4pl"}
             else {"success": False}
         )
@@ -587,7 +609,9 @@ def run_grofit_pipeline(
                     chosen, chosen_name = spline_fit, str(spline_fit.get("method", "spline"))
 
         ec50   = chosen.get("ec50",   np.nan)
-        y_ec50 = chosen.get("y_ec50", np.nan)
+        y_ec50 = float(chosen.get("y_ec50")) if np.isfinite(chosen.get("y_ec50", np.nan)) else np.nan
+        y_ec50_orig = (float(np.expm1(y_ec50)) if log_y == 1 and np.isfinite(y_ec50) else y_ec50)
+
 
         aic_s = spline_fit.get("aic", np.nan)
         aic_m = model_fit.get("aic",  np.nan)
@@ -608,15 +632,15 @@ def run_grofit_pipeline(
         dr_rows.append({
             "name":           test_id,
             "log.x":          log_x,
-            "log.y":          0,
+            "log.y":          log_y,
             "Samples":        int(dr_boot_B) if dr_boot_B > 0 else 0,
             "n.conc":         n_conc,
             "EC50":           chosen.get("ec50_x_transformed", ec50),
             "meanEC50":       np.nan,      # filled from dr_boot below
             "sdEC50":         np.nan,       
-            "yEC50":          y_ec50,
+            "yEC50":          float(chosen.get("y_ec50", np.nan)),
             "EC50.orig":      ec50,
-            "yEC50.orig":     y_ec50,
+            "yEC50.orig":     y_ec50_orig,
             "EC50.low":       np.nan,      # filled from dr_boot below
             "EC50.high":      np.nan,
             "EC50.orig.low":  np.nan,
@@ -704,6 +728,31 @@ def run_grofit_pipeline(
     # ── Optional ZIP export ──────────────────────────────────────────────────
     export_payload: dict = {}
     if export_dir is not None:
+        
+        run_info = {
+             "pipeline_version": PIPELINE_VERSION,
+             "schema_version": SCHEMA_VERSION,
+
+             # grofit.control semantics
+             "fit.opt": fit_opt,
+             "smooth.gc": smooth_gc,                # spar-like; None => CV/auto
+             "smooth.dr": smooth_dr,                # spar-like; None => CV/auto
+             "nboot.gc": int(gc_boot_B),
+             "nboot.dr": int(dr_boot_B),
+             "have.atleast": int(have_atleast),
+             "parameter": response_var,             # DR response metric (y)
+             "log.x.dr": 1 if (dr_x_transform or "none") != "none" else 0,
+             "log.y.dr": log_y_dr,
+             # python-specific explicitness
+             "dr_x_transform": dr_x_transform,
+             "dr_y_transform": dr_y_transform,
+             "gc_lam_raw": spline_s,
+             "dr_lam_raw": dr_s,
+             "spline_auto_cv": bool(spline_auto_cv),
+             "dr_fit_method": dr_fit_method,
+             "bootstrap_method": bootstrap_method,
+         }
+
         export_payload = export_results_zip(
             gc_fit=gc_fit,
             dr_fit=dr_fit,
@@ -711,6 +760,7 @@ def run_grofit_pipeline(
             dr_boot=dr_boot if dr_boot_B > 0 else None,
             out_dir=Path(export_dir),
             zip_name=export_zip_name,
+            run_info=run_info
         )
 
     return {

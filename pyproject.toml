@@ -20,7 +20,7 @@ dependencies = [
     "openpyxl",
     "matplotlib",
     "plotly",
-    "streamlit"
+    "streamlit>=1.40.0,<2"
 ]
 
 [tool.setuptools]

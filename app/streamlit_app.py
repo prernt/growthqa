@@ -2992,7 +2992,7 @@ with top_left:
                     disabled=not dr_invalid_enabled,
                 )
 
-            st.markdown("**Advanced (Parity / Debug)**")
+            st.markdown("**Advanced**")
             override_smoothing = st.checkbox(
                 "Override smoothing (smooth.gc / smooth.dr)",
                 value=False,

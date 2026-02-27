@@ -177,8 +177,9 @@ def build_curve_payloads(
             labels["reviewed"] = bool(row.get("Reviewed", False))
 
         spline = _spline_payload(t_fit, y_fit, spline_s=spline_s, smooth_gc=smooth_gc, auto_cv=spline_auto_cv)
-        label_for_model = labels["final"] or labels["pred"]
-        parametric = _param_payload(t_fit, y_fit) if str(label_for_model).lower() in {"valid", "true", "1"} else {"ran": False}
+        # Always attempt parametric fitting for metrics visibility.
+        # Fit success/failure is handled by _param_payload itself.
+        parametric = _param_payload(t_fit, y_fit)
         bootstrap = {"ran": False}
         if include_bootstrap and boot_df is not None:
             boot_match = boot_df[boot_df["add.id"].astype(str) == str(curve_id)]

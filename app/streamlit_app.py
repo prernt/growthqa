@@ -204,6 +204,32 @@ def _isfinite_scalar(x) -> bool:
         return False
 
 
+def _st_pills_multi(
+    label: str,
+    options: list[str],
+    default: list[str] | None = None,
+    key: str | None = None,
+) -> list[str]:
+    """
+    Backward-compatible multi-select pills.
+    Uses st.pills when available; falls back to st.multiselect on older Streamlit.
+    """
+    default_vals = [str(v) for v in (default or []) if str(v) in {str(o) for o in options}]
+    if hasattr(st, "pills"):
+        selected = st.pills(
+            label,
+            options=options,
+            default=default_vals,
+            selection_mode="multi",
+            key=key,
+        )
+        if selected is None:
+            return []
+        return [str(v) for v in selected]
+    selected = st.multiselect(label, options=options, default=default_vals, key=key)
+    return [str(v) for v in selected]
+
+
 def has_trained_models(model_dir: Path) -> bool:
     p = Path(model_dir)
     if not p.exists():
@@ -1886,11 +1912,10 @@ def render_results(results: dict):
             if manual_review_mode:
                 overlay_options.append("Bootstrap CI")
 
-            overlay_selected = st.pills(
+            overlay_selected = _st_pills_multi(
                 " ",
                 options=overlay_options,
                 default=["Spline Fit", "Parametric Model"],
-                selection_mode="multi",
                 key=f"curve_overlay_pills_{chosen}",
             )
 
@@ -2283,10 +2308,9 @@ def render_results(results: dict):
             with left_dr:
                 st.markdown("#### Dose-Response Curve")
                 if manual_review_mode:
-                    show_dr_boot = st.pills(
+                    show_dr_boot = _st_pills_multi(
                         "",
                         ["Bootstrap CI"],
-                        selection_mode="multi",
                         default=st.session_state.get(dr_pill_key, []),
                         key=dr_pill_key,
                     )

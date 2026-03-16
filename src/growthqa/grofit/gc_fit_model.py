@@ -1,19 +1,4 @@
 # src/growthqa/grofit/gc_fit_model.py
-# ============================================================
-# CORRECTED VERSION v3  – multi-start fitting + degeneracy guard
-#
-# Changes vs v2:
-#   1. _multi_start_fit(): tries multiple (p0) combinations per model
-#      and keeps the best non-degenerate solution (lowest RSS).
-#   2. _is_degenerate(): rejects fits whose SE > 1000× |parameter|
-#      — the hallmark of a near-singular Jacobian (e.g. concentration
-#      3 µM Richards blowup in v2 where mu_se = 5935, mu = 0.078).
-#   3. _inhibition_seeds(): generates negative-λ starting points for
-#      heavily inhibited curves, recovering the R solution at
-#      30, 100, 300 µM.
-#   4. Richards multi-start varies ν ∈ {0.5, 1.0, 2.0} across all
-#      seed vectors to escape the local-minimum trap seen at 3 µM.
-# ============================================================
 from __future__ import annotations
 
 import numpy as np
@@ -151,7 +136,7 @@ def _multi_start_fit(
                 p0=p0_clipped,
                 bounds=spec.bounds,
                 maxfev=20_000,
-                method="trf",   # Trust Region Reflective — handles bounds robustly
+                method="trf",   
             )
         except Exception:
             continue

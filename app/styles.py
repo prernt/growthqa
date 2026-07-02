@@ -1,4 +1,4 @@
-# app/ui/styles.py
+# app/styles.py
 """
 Injects the application-wide CSS.  Call ``inject_css()`` once at page top.
 """

@@ -56,8 +56,18 @@ def load_wide_csv(path: str) -> pd.DataFrame:
     df["Is_Valid"] = coerce_is_valid_bool(df["Is_Valid"])
 
     # Domain flags (kept explicit in meta to mitigate synthetic/lab shift).
+    # Prefer content-based detection via the "Curve Subtype" marker column
+    # (present only in synthetically generated wide CSVs) over filename
+    # inference, since filenames are not a reliable signal (e.g. a file
+    # named "timeseries_wide_SD1.csv" contains no "syn" substring even
+    # though every row in it is synthetic).
     stem = Path(path).stem.lower()
-    inferred_source = "synthetic" if ("syn" in stem or "synthetic" in stem) else "lab"
+    filename_source = "synthetic" if ("syn" in stem or "synthetic" in stem) else "lab"
+    if "Curve Subtype" in df.columns:
+        has_subtype = df["Curve Subtype"].notna() & (df["Curve Subtype"].astype(str).str.strip() != "")
+        inferred_source = np.where(has_subtype, "synthetic", "lab")
+    else:
+        inferred_source = filename_source
     if "source_type" not in df.columns:
         df["source_type"] = inferred_source
     df["source_type"] = (

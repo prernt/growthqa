@@ -148,7 +148,6 @@ def get_model_specs(t: np.ndarray, y: np.ndarray) -> Dict[str, ModelSpec]:
     y0_min = float(np.nanmin(y)) - 2.0
     y0_max = float(np.nanmax(y)) + 2.0
     A_max  = max(1e-6, float(np.nanmax(y) - np.nanmin(y)) * 10.0)
-    t_min  = float(np.nanmin(t))
     t_max  = float(np.nanmax(t))
     # Allow negative lag (inflection before t=0) — key fix for R parity
     lam_min = -t_max * 3.0

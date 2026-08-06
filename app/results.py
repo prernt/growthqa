@@ -1,4 +1,4 @@
-# app/ui/results.py
+# app/results.py
 """
 render_results(results) — the full results section:
   summary metrics, single-curve review tab, dose-response tab,
@@ -23,6 +23,7 @@ from utils import (
     make_curve_key,
     normalize_bootstrap_method,
     normalize_label,
+    resolve_display_label,
     label_is_valid,
     to_numeric_scalar,
 )
@@ -101,8 +102,8 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
     dr_fit          = results.get("dr_fit",          pd.DataFrame())
     gc_boot         = results.get("gc_boot",         pd.DataFrame())
     dr_boot         = results.get("dr_boot",         pd.DataFrame())
-    gc_audit        = results.get("gc_audit",        pd.DataFrame())
-    dr_audit        = results.get("dr_audit",        pd.DataFrame())
+    # gc_audit        = results.get("gc_audit",        pd.DataFrame())
+    # dr_audit        = results.get("dr_audit",        pd.DataFrame())
     grofit_tidy_all = results.get("grofit_tidy_all", pd.DataFrame())
     zip_bytes       = results.get("zip_bytes", b"")
     grofit_ran      = results.get("grofit_ran", False)
@@ -172,13 +173,17 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
 
     pred_col = next(
         (c for c in ["pred_label", "Pred Label", "final_label",
-                     "true_label", "Predicted S1 Label"] if c in curve_df.columns),
+                     "true_label"] if c in curve_df.columns),
         None,
     )
     if pred_col is None:
         pred_col = "_pred_label_fallback"
         curve_df[pred_col] = ""
-    curve_df["_filter_label"] = curve_df[pred_col].map(normalize_label)
+    # Filter by True Label: human review if present, else the combined
+    # Stage-1+Stage-2 decision. Not the Stage-1-only Pred Label.
+    curve_df["_filter_label"] = curve_df.apply(
+        lambda r: resolve_display_label(r, fallback=str(r.get(pred_col, ""))), axis=1,
+    )
 
     # ---- summary metrics ----
     st.markdown("---")
@@ -271,13 +276,27 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
         elif isinstance(bv, (int, float, np.integer, np.floating)) and pd.notna(bv):
             pred_label = "Valid" if int(bv) == 1 else "Invalid"
 
+    display_label = normalize_label(
+        out_row.get("Final Label (S1+S2)", out_row.get("final_label", pred_label))
+    )
+    if not display_label:
+        display_label = pred_label
+
     pred_conf_display = pd.to_numeric(
         pd.Series([out_row.get("Pred Confidence", out_row.get("pred_confidence", np.nan))]),
         errors="coerce",
     ).iloc[0]
 
-    final_label = (normalize_label(row.get("true_label", row.get("final_label", pred_label)))
-                   if manual_review_mode else pred_label)
+    label_reason_raw = str(out_row.get("Label Reason", "") or "")
+    label_reason_display = label_reason_raw
+    for _prefix in ("S1_", "S2_"):
+        if label_reason_display.startswith(_prefix):
+            label_reason_display = label_reason_display[len(_prefix):]
+            break
+    label_reason_display = label_reason_display.replace(") = ", ") ")
+
+
+    final_label = resolve_display_label(row, fallback=pred_label) if manual_review_mode else pred_label
     if not final_label:
         final_label = "Valid" if bool(row.get("is_valid_true", label_is_valid(pred_label))) else "Invalid"
 
@@ -296,7 +315,7 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
 
     # ---- resolve best gc_fit / gc_boot rows for chosen curve ----
     active_test_id = str(file_stem)
-    fit_row = boot_row = None
+    fit_row = None
     if isinstance(gc_fit, pd.DataFrame) and not gc_fit.empty and "add.id" in gc_fit.columns:
         fm = gc_fit[gc_fit["add.id"].astype(str) == str(chosen)]
         if not fm.empty:
@@ -313,14 +332,6 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
                     active_test_id = str(fit_row.get("test.id", file_stem))
             else:
                 fit_row = fm.iloc[0]
-    if isinstance(gc_boot, pd.DataFrame) and not gc_boot.empty and "add.id" in gc_boot.columns:
-        bm = gc_boot[gc_boot["add.id"].astype(str) == str(chosen)]
-        if not bm.empty:
-            if "test.id" in bm.columns:
-                exact = bm[bm["test.id"].astype(str) == str(active_test_id)]
-                boot_row = exact.iloc[0] if not exact.empty else bm.iloc[0]
-            else:
-                boot_row = bm.iloc[0]
 
     # ---- build curve payload ----
     curve_payload = None
@@ -457,7 +468,7 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
                     f"<div style='border:1px solid #8f8f8f;border-radius:8px;padding:8px 10px;"
                     f"margin:4px 0 10px 0;'>"
                     f"<div style='font-size:1.0rem;font-weight:500;'>Predicted Label</div>"
-                    f"<div style='font-size:1.2rem;font-weight:700;color:{lc};'>{pred_label}</div>"
+                    f"<div style='font-size:1.2rem;font-weight:700;color:{lc};'>{display_label}</div>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
@@ -470,7 +481,7 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
                     rev_key = f"reviewed_{curve_key}"
 
                     if lbl_key not in st.session_state:
-                        tn = normalize_label(row.get("true_label", row.get("final_label", pred_label)))
+                        tn = resolve_display_label(row, fallback=pred_label)
                         st.session_state[lbl_key] = tn if tn in {"Valid","Invalid","Unsure"} else "Unsure"
                     if rev_key not in st.session_state:
                         st.session_state[rev_key] = "True" if bool(row.get("Reviewed", False)) else "False"
@@ -485,7 +496,7 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
                                                      rev_key)
                     reviewed_bool = reviewed_val == "True"
 
-                    old_final    = normalize_label(row.get("true_label", row.get("final_label", pred_label)))
+                    old_final    = resolve_display_label(row, fallback=pred_label)
                     old_reviewed = bool(row.get("Reviewed", False))
                     if new_final != old_final or reviewed_bool != old_reviewed:
                         review_df.loc[review_df["CurveKey"] == curve_key, "true_label"]    = new_final
@@ -511,8 +522,13 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
                         st.session_state["last_run_results"] = results
                         st.rerun()
 
-                conf_text = "" if pred_label.strip().lower() == "unsure" else _fmt_metric(pred_conf_display)
-                render_metric_row(f"Confidence ({pred_label})", conf_text)
+                # conf_text = "" if pred_label.strip().lower() == "unsure" else _fmt_metric(pred_conf_display)
+                # render_metric_row(f"Confidence ({pred_label})", conf_text)
+                if display_label.strip().lower() == "unsure":
+                    render_metric_row(f"Confidence ({display_label})", label_reason_display)
+                else:
+                    conf_text = _fmt_metric(pred_conf_display)
+                    render_metric_row(f"Confidence ({display_label})", conf_text)
 
             # -- grofit metrics table --
             if curve_payload:
@@ -562,51 +578,17 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
             st.download_button("Download Results.zip", data=zip_bytes, file_name=zip_name,
                                mime="application/zip", disabled=not zip_ready,
                                use_container_width=True,
-                               help="Contains gc_fit, gc_boot, dr_fit, dr_boot, and a plots folder")
+                               help="Biologist-facing results: gcFit, gcBoot, drFit, drBoot, and a plots folder "
+                                    "(mirrors the Grofit-R output files).")
 
-            # auditing zip
-            audit_run_info = {
-                "mode": "MANUAL" if manual_review_mode else "AUTO",
-                "timestamp": datetime.now().isoformat(),
-                "file_stem": file_stem, "predicting_model": predicting_model,
-                "grofit_options": grofit_opts.__dict__ if grofit_opts else None,
-                "settings": settings.__dict__ if settings else None,
-                "pipeline_filters": {
-                    "gc_bootstrap": (st.session_state.get("exit_gc_bootstrap","False")
-                                     if manual_review_mode
-                                     else st.session_state.get("auto_bootstrap_scope","False")),
-                    "preferred_fit": (st.session_state.get("exit_preferred_model","Best Model")
-                                      if manual_review_mode
-                                      else st.session_state.get("auto_preferred_model","Best Model")),
-                    "response_metric": (st.session_state.get("exit_response_metric","mu")
-                                        if manual_review_mode
-                                        else st.session_state.get("auto_response_metric","mu")),
-                    "dr_bootstrap": (st.session_state.get("exit_dr_bootstrap","False")
-                                     if manual_review_mode
-                                     else st.session_state.get("auto_dr_bootstrap","False")),
-                    "export_label_filter": results.get("export_label_filter","Valid"),
-                    "export_dr_include_unsure":  bool(results.get("export_dr_include_unsure",False)),
-                    "export_dr_include_invalid": bool(results.get("export_dr_include_invalid",False)),
-                },
-                "stage2_thresholds": results.get("stage2_config"),
-                "versions": {"python": sys.version, "numpy": np.__version__,
-                             "pandas": pd.__version__, "sklearn": sklearn.__version__},
-            }
-            az_bio = io.BytesIO()
-            with zipfile.ZipFile(az_bio, "w", compression=zipfile.ZIP_DEFLATED) as az:
-                az.writestr("Classifier Audit.csv", audit_df.to_csv(index=False))
-                if isinstance(gc_audit, pd.DataFrame) and not gc_audit.empty:
-                    az.writestr("GC Audit.csv", gc_audit.to_csv(index=False))
-                if isinstance(dr_audit, pd.DataFrame) and not dr_audit.empty:
-                    az.writestr("DR Audit.csv", dr_audit.to_csv(index=False))
-                if isinstance(grofit_df, pd.DataFrame) and not grofit_df.empty:
-                    gout = grofit_df.drop(columns=["FileName","Model Name","Is_Valid"], errors="ignore")
-                    az.writestr("Grofit.csv", gout.to_csv(index=False))
-                az.writestr("run_info.json", json.dumps(audit_run_info, indent=2))
-            st.download_button("Download Auditing.zip", data=az_bio.getvalue(),
-                               file_name="Auditing.zip", mime="application/zip",
+            audit_zip_bytes = results.get("audit_zip_bytes", b"")
+            audit_zip_name  = results.get("audit_zip_name") or f"Auditing_{file_stem}.zip"
+            st.download_button("Download Auditing.zip", data=audit_zip_bytes, file_name=audit_zip_name,
+                               mime="application/zip", disabled=not zip_ready,
                                use_container_width=True,
-                               help="Contains classifier audit, GC/DR audits, and run metadata.")
+                               help="Pipeline config (run_info.json), classifier audit (Stage-1/2 features "
+                                    "and predictions), classifier training performance, the Grofit input file "
+                                    "for transparency, and the GC/DR model-selection diagnostics.")
 
     # -------------------------------------------------------------------
     # TAB 2 – Dose response
@@ -653,7 +635,6 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
                 )
                 fit_pl  = tab_dr_payload.get("fit", {})
                 ec50    = to_numeric_scalar(fit_pl.get("ec50"))
-                y_mid   = to_numeric_scalar(fit_pl.get("y_mid"))
                 dr_method = fit_pl.get("dr_method")
                 ec50_status = fit_pl.get("ec50_status")
                 boot    = tab_dr_payload.get("bootstrap", {})
@@ -763,6 +744,7 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
                 gc_fit2 = dr_fit2 = gc_boot2 = dr_boot2 = pd.DataFrame()
                 gc_aud2 = dr_aud2 = pd.DataFrame()
                 zip_bytes2 = b""; zip_name2 = ""
+                audit_zip_bytes2 = b""; audit_zip_name2 = ""
 
                 if not gt_all.empty:
                     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
@@ -785,10 +767,11 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
                         dr_boot2 = res2.get("dr_boot", pd.DataFrame())
                         gc_aud2  = res2.get("gc_audit", pd.DataFrame())
                         dr_aud2  = res2.get("dr_audit", pd.DataFrame())
-                        zip_name2, zip_bytes2 = build_export_zip(
+                        zip_name2, zip_bytes2, audit_zip_name2, audit_zip_bytes2 = build_export_zip(
                             wide_df=wide_original, out_df=out_df, review_df=review_df,
                             gc_fit=gc_fit2, gc_boot=gc_boot2,
                             dr_fit=dr_fit2, dr_boot=dr_boot2,
+                            gc_audit=gc_aud2, dr_audit=dr_aud2,
                             proc_wide_df=final_merged, grofit_opts=eff,
                             settings=settings, mode_label="MANUAL", file_stem=file_stem,
                             predicting_model=predicting_model,
@@ -808,6 +791,8 @@ def render_results(results: dict) -> None:  # noqa: C901 (long but cohesive)
                 gc_audit=gc_aud2, dr_audit=dr_aud2,
                 zip_bytes=zip_bytes2,
                 zip_name=zip_name2 if zip_name2 else "",
+                audit_zip_bytes=audit_zip_bytes2,
+                audit_zip_name=audit_zip_name2 if audit_zip_name2 else "",
                 grofit_ran=True,
             )
             st.session_state["last_run_results"] = results

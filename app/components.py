@@ -1,4 +1,4 @@
-# app/ui/components.py
+# app/components.py
 """
 Reusable Streamlit UI primitives: pills, error display, metric rows.
 """
@@ -32,16 +32,6 @@ def show_friendly_error(exc: Exception) -> None:
         unsafe_allow_html=True,
     )
     st.caption(f"Error: {type(exc).__name__}: {exc}")
-
-
-def line_with_tooltip(label: str, value: object, tooltip: str) -> None:
-    safe_val = "" if value is None else value
-    icon = (f'<sup style="margin-left:6px;color:#888;" title="{tooltip}">🛈</sup>'
-            if tooltip else "")
-    st.markdown(
-        f'<div title="{tooltip}"><strong>{label}:</strong> {safe_val}{icon}</div>',
-        unsafe_allow_html=True,
-    )
 
 
 def render_metric_row(label: str, value: str | None = None,

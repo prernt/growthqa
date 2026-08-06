@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Iterable
 import re
 
 import numpy as np
 import pandas as pd
 
-from growthqa.preprocess.timegrid import parse_time_from_header
+from growthqa.preprocess.timegrid import get_sorted_time_columns
+from app.utils import resolve_display_label
 
 
 # ============================================================
@@ -50,6 +50,7 @@ AUDIT_LATE_DEBUG_FEATURES: list[str] = [
     "late_slope",
     "late_delta",
     "noise_level",
+    "decline_score",
     "late_growth_detected",
     "artifact_detected",
 ]
@@ -58,13 +59,6 @@ def _col_as_series(df: pd.DataFrame, col: str, default=np.nan) -> pd.Series:
     if col in df.columns:
         return df[col]
     return pd.Series([default] * len(df), index=df.index)
-
-def _sorted_time_cols(df: pd.DataFrame) -> list[str]:
-    cols = [c for c in df.columns if parse_time_from_header(str(c)) is not None]
-    return sorted(
-        cols,
-        key=lambda c: parse_time_from_header(str(c)) if parse_time_from_header(str(c)) is not None else float("inf"),
-    )
 
 
 def _test_id_encodes_conc(s: object) -> bool:
@@ -121,7 +115,7 @@ def build_classifier_audit_df(
         raise ValueError("wide_original_df must contain 'Test Id'.")
 
     # Time columns from original
-    time_cols = _sorted_time_cols(wide_original_df)
+    time_cols = get_sorted_time_columns(wide_original_df)
 
     # Normalize IDs
     wide0 = _with_curve_id(wide_original_df)
@@ -136,7 +130,7 @@ def build_classifier_audit_df(
         "curve_id",
         "Pred Label",
         "Pred Confidence",
-        "Predicted S1 Label",
+        # "Predicted S1 Label",
         "S1 Confidence Valid",
         "Stage 2 Label",
         "Label Reason",
@@ -161,7 +155,7 @@ def build_classifier_audit_df(
     proc_added_cols: list[str] = []
     if isinstance(processed_wide_df, pd.DataFrame) and not processed_wide_df.empty:
         proc0 = _with_curve_id(processed_wide_df)
-        proc_time_cols = _sorted_time_cols(proc0)
+        proc_time_cols = get_sorted_time_columns(proc0)
         if proc_time_cols:
             # merge on curve_key if present in proc0
             if "curve_key" in proc0.columns:
@@ -212,13 +206,11 @@ def build_classifier_audit_df(
                         df["true_label"] = _col_as_series(df, col_name).combine_first(_col_as_series(df, "true_label", np.nan))
                         df.drop(columns=[col_name], inplace=True)
 
-    # True Label:
-    # - MANUAL: should reflect human label when available (true_label), else Pred Label
-    # - AUTO: mirrors Pred Label (no ground truth yet)
     if "Pred Label" not in df.columns:
         df["Pred Label"] = _col_as_series(df, "final_label", _col_as_series(df, "pred_label", ""))
 
-    df["True Label"] = _col_as_series(df, "true_label", df["Pred Label"])
+    df["True Label"] = df.apply(lambda r: resolve_display_label(r, fallback=str(r.get("Pred Label", ""))), axis=1)
+
 
     # normalize Reviewed to boolean
     df["Reviewed"] = _col_as_series(df, "Reviewed", False).fillna(False).astype(bool)
@@ -249,7 +241,7 @@ def build_classifier_audit_df(
             # They differ somewhere → keep both (debug needed)
             pass
     for must in ["Test Id", "Concentration", "curve_key", "Pred Label", "Pred Confidence",
-                 "Predicted S1 Label", "S1 Confidence Valid", "S1 Confidence Invalid",
+                  "S1 Confidence Valid", "S1 Confidence Invalid",
                  "Stage 2 Label", "Label Reason", "True Label", "Reviewed"]:
         if must in df.columns and must not in ordered:
             ordered.insert(min(len(ordered), 3) if must in {"curve_key"} else len(ordered), must)
@@ -266,5 +258,7 @@ def build_classifier_audit_df(
         if c not in seen:
             ordered_unique.append(c)
             seen.add(c)
+        if mode.upper() != "MANUAL":
+            ordered_unique = [c for c in ordered_unique if c != "Reviewed"]
 
     return df[ordered_unique].copy()

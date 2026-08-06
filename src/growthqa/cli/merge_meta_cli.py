@@ -2,163 +2,41 @@
 from __future__ import annotations
 
 import argparse
-import logging
-from pathlib import Path
+import json
 
-from growthqa.pipelines.build_meta_dataset import run_merge_preprocess_meta
+from growthqa.pipelines.build_meta_dataset import build_training_meta
+
 
 def add_merge_meta_subcommand(subparsers: argparse._SubParsersAction) -> None:
-    """
-    Mirrors the original merge_meta.py CLI:
-      python merge_meta.py --step 0.25 --auto-tmax --auto-tmax-coverage 0.8 ...
-    but routed through the modular pipeline function run_merge_preprocess_meta().
+    """Single, minimal command to build the training dataset.
+
+    The  training_meta.csv is produced with a pinned configuration, so the
+    command exposes only the inputs and the output directory. All
+    preprocessing settings live in build_meta_dataset.TRAIN_* and are shared
+    with the inference path, which removes the earlier flag surface and the
+    risk of building the dataset with settings that differ from inference.
+
+    --lab is optional. With it, the command merges synthetic and laboratory
+    data and writes raw_merged.csv, final_merged.csv and training_meta.csv.
+    Without it, the command trains on the synthetic data alone and writes
+    only final_merged.csv and training_meta.csv (no raw_merged.csv, since
+    there is nothing to merge).
     """
     p = subparsers.add_parser(
-        "merge-meta",
-        help="Merge already-converted wide growth curves, preprocess, and build rich meta-features.",
+        "build-train-meta",
+        help="Build final_merged.csv and training_meta.csv (plus raw_merged.csv if --lab is given) for classifier training.",
     )
+    p.add_argument("--synthetic", required=True, help="Synthetic wide CSV (e.g. timeseries_wide_SD1.csv).")
+    p.add_argument("--lab", required=False, default=None, help="Optional laboratory wide CSV (e.g. lab_14.75h_0.25.csv).")
+    p.add_argument("--out-dir", required=True, help="Directory for the output files.")
+    p.set_defaults(_fn=_run)
 
-    # positional: inputs
-    p.add_argument("inputs", nargs="+", help="Input CSV(s), already converted to wide format.")
 
-    # interpolation / grid
-    p.add_argument("--step", type=float, default=0.5, help="Common grid step (hours). Default 0.5.")
-    p.add_argument("--min-points", type=int, default=3, help="Min finite points required to interpolate. Default 3.")
-    p.add_argument(
-        "--low-res-threshold",
-        type=int,
-        default=7,
-        help="Curves with min_points..(low_res_threshold-1) points flagged low_resolution. Default 7.",
+def _run(args: argparse.Namespace) -> int:
+    info = build_training_meta(
+        synthetic_csv=args.synthetic,
+        lab_csv=args.lab,
+        out_dir=args.out_dir,
     )
-    p.add_argument("--tmax-hours", type=float, default=None, help="Optional cap on grid max time (hours).")
-    p.add_argument(
-        "--auto-tmax",
-        action="store_true",
-        default=False,
-        help="If set, choose tmax so >=coverage fraction of curves reach it.",
-    )
-    p.add_argument(
-    "--no-auto-tmax",
-    action="store_true",
-    default=False,
-    help="Disable auto-tmax (use --tmax-hours or infer from columns).",
-    )
-
-    p.add_argument(
-        "--auto-tmax-coverage",
-        type=float,
-        default=0.8,
-        help="Coverage for auto-tmax. Default 0.8.",
-    )
-
-    # blank subtraction / baseline
-    p.add_argument(
-        "--blank-subtracted",
-        action="store_true",
-        default=False,
-        help="Apply blank/baseline subtraction (recommended if raw data).",
-    )
-    p.add_argument(
-        "--clip-negatives",
-        action="store_true",
-        default=False,
-        help="After blank subtraction, clip negative OD values to 0.",
-    )
-    p.add_argument(
-        "--global-blank",
-        type=float,
-        default=None,
-        help="If set, subtract this constant blank OD. Otherwise subtract robust early baseline.",
-    )
-    p.add_argument(
-        "--blank-status-csv",
-        type=str,
-        default=None,
-        help="CSV mapping FileName -> already_blank_subtracted (RAW/ALREADY) and optional blank_value.",
-    )
-    p.add_argument(
-        "--blank-default",
-        type=str,
-        default="ALREADY",
-        choices=["RAW", "ALREADY"],
-        help="Default blank status if FileName not in blank-status-csv.",
-    )
-
-    # smoothing
-    p.add_argument(
-        "--smooth-method",
-        type=str,
-        default="SGF",
-        choices=["NONE", "RAW", "LWS", "SGF"],
-        help="Smoothing method: NONE, RAW (rolling), LWS (LOWESS), SGF (Savitzky–Golay).",
-    )
-    p.add_argument("--smooth-window", type=int, default=5, help="Window size (points) for smoothing. Default 5.")
-
-    # normalization
-    p.add_argument(
-        "--normalize",
-        type=str,
-        default="MINMAX",
-        choices=["NONE", "MAX", "MINMAX"],
-        help="Within-curve normalization. Default NONE.",
-    )
-
-    # outputs (required like original script)
-    p.add_argument("--out-raw", required=True, help="Output raw_merged.csv")
-    p.add_argument("--out-final", required=True, help="Output final_merged.csv")
-    p.add_argument("--out-meta", required=True, help="Output meta.csv")
-
-    # logging
-    p.add_argument(
-        "--loglevel",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level.",
-    )
-
-    p.add_argument("--augment-trunc", action="store_true", default=False)
-    p.add_argument("--trunc-horizons", nargs="+", type=float, default=[8, 10, 12, 14.75, 16])
-    p.add_argument("--trunc-per-curve", type=int, default=3)
-    p.add_argument("--trunc-seed", type=int, default=123)
-    p.add_argument("--rich-meta", action="store_true", default=False, help="Include expensive parametric model-fit features.")
-
-    p.set_defaults(_fn=_run_merge_meta)
-
-
-def _run_merge_meta(args: argparse.Namespace) -> int:
-    # ensure output dirs exist
-    Path(args.out_raw).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out_final).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out_meta).parent.mkdir(parents=True, exist_ok=True)
-
-    logging.basicConfig(level=getattr(logging, args.loglevel), format="%(levelname)s: %(message)s")
-
-    run_merge_preprocess_meta(
-        inputs=args.inputs,
-        out_raw=args.out_raw,
-        out_final=args.out_final,
-        out_meta=args.out_meta,
-        step=float(args.step),
-        min_points=int(args.min_points),
-        low_res_threshold=int(args.low_res_threshold),
-        tmax_hours=args.tmax_hours,
-        auto_tmax=args.auto_tmax and (not args.no_auto_tmax),
-        auto_tmax_coverage=float(args.auto_tmax_coverage),
-        blank_subtracted=bool(args.blank_subtracted),
-        clip_negatives=bool(args.clip_negatives),
-        global_blank=args.global_blank,
-        blank_status_csv=args.blank_status_csv,
-        blank_default=str(args.blank_default).upper(),
-        smooth_method=str(args.smooth_method).upper(),
-        smooth_window=int(args.smooth_window),
-        normalize=str(args.normalize).upper(),
-        loglevel=str(args.loglevel).upper(),
-        augment_trunc=args.augment_trunc,
-        trunc_horizons=args.trunc_horizons,
-        trunc_per_curve=args.trunc_per_curve,
-        trunc_seed=args.trunc_seed,
-        rich_meta=bool(args.rich_meta),
-
-    )
+    print(json.dumps(info, indent=2))
     return 0

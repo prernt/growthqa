@@ -1,25 +1,19 @@
-# app/core/utils.py
+# app/utils.py
 """
-Pure utility functions: numeric helpers, label normalisation, model version
-checking, concentration parsing, and sample-data generators.
+Pure utility functions used by the Streamlit layer: numeric helpers, label
+normalisation, concentration parsing, and sample-data generators.
 No Streamlit dependency.
+
+Model loading, runtime/version checking and the legacy-pickle alias shim live
+once in the pipeline layer (growthqa.pipelines.infer_labels); they are not
+duplicated here.
 """
 from __future__ import annotations
 
-import importlib
-import json
-import platform
 import re
-import sys
-from datetime import datetime
-from pathlib import Path
 
-import joblib
 import numpy as np
 import pandas as pd
-import sklearn
-
-from config import GrofitOptions, InferenceSettings, MODEL_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -38,13 +32,6 @@ def safe_float(x, default=None):
 
 def to_numeric_scalar(x) -> float:
     return float(pd.to_numeric(pd.Series([x]), errors="coerce").iloc[0])
-
-
-def isfinite_scalar(x) -> bool:
-    try:
-        return bool(np.isfinite(to_numeric_scalar(x)))
-    except Exception:
-        return False
 
 
 def normalize_bootstrap_method(v: object) -> str:
@@ -68,19 +55,26 @@ def normalize_label(v: object) -> str:
         return "Unsure"
     return str(v).strip()
 
+def resolve_display_label(row, *, fallback: str = "") -> str:
+    """
+    Single source of truth for 'what label applies to this curve right now'.
+    Priority: human review (true_label) > combined Stage-1+Stage-2 decision
+    (final_label) > Stage-1-only Pred Label. Used wherever a label needs to
+    be read for display or for deciding what feeds downstream, so all call
+    sites agree on the same order instead of each re-deriving it.
+    """
+    getter = row.get if hasattr(row, "get") else (lambda k, d=None: d)
+    for key in ("true_label", "True Label", "final_label", "Final Label (S1+S2)", "Pred Label", "pred_label"):
+        val = getter(key, None)
+        if val is not None and str(val).strip():
+            return normalize_label(val)
+    return fallback
+
 
 def label_is_valid(label: object) -> bool:
     if label is None or (isinstance(label, float) and pd.isna(label)):
         return False
     return str(label).strip().lower() in {"valid", "true", "1"}
-
-
-def labels_to_prob_valid(labels: np.ndarray) -> np.ndarray:
-    lbl  = np.char.lower(labels.astype(str))
-    prob = np.full(lbl.shape, np.nan, dtype=float)
-    prob[np.isin(lbl, ["valid",   "true",  "1"])] = 1.0
-    prob[np.isin(lbl, ["invalid", "false", "0"])] = 0.0
-    return prob
 
 
 # ---------------------------------------------------------------------------
@@ -103,54 +97,9 @@ def extract_conc_from_curve_id(curve_id: str) -> float | None:
         return None
 
 
-def strip_bracketed_suffix(value: str) -> str:
-    return "" if value is None else re.sub(r"\s*\[.*?\]\s*", "", str(value)).strip()
-
-
 def make_curve_key(test_id: str, concentration: object) -> str:
     conc = "" if concentration is None or pd.isna(concentration) else str(concentration)
     return f"{test_id}|{conc}"
-
-
-# ---------------------------------------------------------------------------
-# Model version checking
-# ---------------------------------------------------------------------------
-
-def assert_runtime_matches_model(model_path: str) -> None:
-    """Warn to stderr when runtime versions differ from those used at training time."""
-    mp       = Path(model_path)
-    manifest = mp.with_suffix(".manifest.json")
-    if not manifest.exists():
-        return
-
-    m        = json.loads(manifest.read_text(encoding="utf-8"))
-    problems = []
-    if m.get("python_version") != platform.python_version():
-        problems.append(f"Python {platform.python_version()} != trained {m.get('python_version')}")
-    if m.get("sklearn_version") != sklearn.__version__:
-        problems.append(f"sklearn {sklearn.__version__} != trained {m.get('sklearn_version')}")
-    if m.get("numpy_version") != np.__version__:
-        problems.append(f"numpy {np.__version__} != trained {m.get('numpy_version')}")
-    if m.get("joblib_version") != joblib.__version__:
-        problems.append(f"joblib {joblib.__version__} != trained {m.get('joblib_version')}")
-
-    if problems:
-        print(
-            "Model/runtime version mismatch detected:\n"
-            + "\n".join(f"- {p}" for p in problems)
-            + "\nProceeding anyway; retrain or regenerate models to silence this warning.",
-            file=sys.stderr,
-        )
-
-
-def install_legacy_sklearn_pickle_aliases() -> None:
-    legacy = "sklearn.ensemble._hist_gradient_boosting.loss"
-    if legacy in sys.modules:
-        return
-    try:
-        sys.modules[legacy] = importlib.import_module("sklearn._loss.loss")
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +127,7 @@ def make_sample_wide_csv_bytes() -> bytes:
 def make_sample_long_csv_bytes() -> bytes:
     """Long-format sample: Time column + wells as columns with encoded concentrations."""
     times = [0, 0.5, 1, 1.5, 2, 3, 3.5, 4, 4.5, 5, 6, 7, 8]
-    cols  = [
+    cols = [
         ("A01[Conc=0.0]", 0.0), ("A02[0.1]",     0.1),
         ("A03[Conc=0.3]", 0.3), ("A04[1.0]",     1.0),
         ("A05[Conc=3.0]", 3.0), ("A06[10.0]",   10.0),

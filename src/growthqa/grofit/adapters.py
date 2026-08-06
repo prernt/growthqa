@@ -25,7 +25,7 @@ class GrofitAdapterConfig:
     # common incoming column aliases
     time_col_aliases: Tuple[str, ...] = ("Time (h)", "time", "Time", "t", "T")
     test_id_aliases: Tuple[str, ...] = ("test_id", "Test Id", "TestID", "testid")
-    curve_id_aliases: Tuple[str, ...] = ("curve_id", "Curve Id", "CurveID", "well", "Well")
+    # curve_id_aliases: Tuple[str, ...] = ("curve_id", "Curve Id", "CurveID", "well", "Well")
     conc_aliases: Tuple[str, ...] = ("concentration", "Concentration", "conc", "Conc", "dose", "Dose")
 
     # prediction/meta output aliases
@@ -318,51 +318,3 @@ def attach_validity_from_predictions(
     out = out.merge(pred_map, on=[config.out_test_id, config.out_curve_id], how="left")
     out[config.out_is_valid] = out[config.out_is_valid].fillna(bool(default_if_missing)).astype(bool)
     return out
-
-
-# ------------------------------------------------------------
-# One-call convenience for your exact file patterns
-# ------------------------------------------------------------
-
-def build_tidy_for_grofit(
-    input_df: pd.DataFrame,
-    *,
-    predictions_df: Optional[pd.DataFrame] = None,
-    config: GrofitAdapterConfig = GrofitAdapterConfig(),
-    file_test_id: Optional[str] = None,
-    delim: str = "_",
-) -> pd.DataFrame:
-    """
-    Auto-detect and convert:
-      - if has 'Time (h)' + multiple curve columns -> time-well adapter
-      - else if has 'Test Id' + T*. (h) columns -> wide-per-curve adapter
-
-    Then optionally attach validity from predictions.
-    """
-    cols = set(map(str, input_df.columns))
-
-    time_col = _first_existing_col(input_df, config.time_col_aliases)
-    has_time_well = time_col is not None and len(cols) >= 2 and "T0.00 (h)" not in cols
-
-    has_wide_rows = _first_existing_col(input_df, config.test_id_aliases) is not None and len(_infer_time_cols(input_df)) > 0
-
-    if has_time_well and not has_wide_rows:
-        tidy = input_time_well_to_tidy(input_df, config=config, file_test_id=file_test_id)
-    elif has_wide_rows:
-        tidy = input_wide_curve_rows_to_tidy(input_df, config=config, file_test_id=file_test_id)
-    else:
-        raise ValueError("Could not detect input format. Provide a known format.")
-
-    if predictions_df is not None:
-        if file_test_id is None:
-            raise ValueError("file_test_id is required to attach predictions (needed to match 'testSample1_*').")
-        tidy = attach_validity_from_predictions(
-            tidy,
-            predictions_df,
-            config=config,
-            delim=delim,
-        )
-    else:
-        tidy[config.out_is_valid] = True
-
-    return tidy

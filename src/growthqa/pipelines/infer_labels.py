@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -12,10 +14,17 @@ import pandas as pd
 import platform
 import sklearn
 
-from growthqa.pipelines.build_meta_dataset import run_merge_preprocess_meta
-from growthqa.preprocess.timegrid import parse_time_from_header
+from growthqa.pipelines.build_meta_dataset import (
+    run_merge_preprocess_meta,
+    TRAIN_STEP_HOURS,
+    TRAIN_TMAX_HOURS,
+    TRAIN_SMOOTH_METHOD,
+    TRAIN_SMOOTH_WINDOW,
+    TRAIN_NORMALIZE,
+)
+from growthqa.preprocess.timegrid import parse_time_from_header, get_sorted_time_columns
 
-# NEW Stage-2 (evidence-based)
+# Stage-2 (evidence-based checker)
 from growthqa.stage2.late_window import (
     Stage2ConfigEvidence,
     EvidenceScores,
@@ -25,7 +34,7 @@ from growthqa.stage2.late_window import (
 
 
 # ============================================================
-# Model loading utilities (unchanged from your zip)
+# Model loading utilities
 # ============================================================
 def assert_runtime_matches_model(model_path: str) -> None:
     mp = Path(model_path)
@@ -33,7 +42,7 @@ def assert_runtime_matches_model(model_path: str) -> None:
     if not manifest.exists():
         return
 
-    m = __import__("json").loads(manifest.read_text(encoding="utf-8"))
+    m = json.loads(manifest.read_text(encoding="utf-8"))
     problems = []
     if m.get("python_version") != platform.python_version():
         problems.append(f"Python {platform.python_version()} != trained {m.get('python_version')}")
@@ -81,7 +90,7 @@ def discover_models(model_dir: str | Path) -> dict[str, Path]:
     return {f.stem: f for f in sorted(p.glob("*.joblib"))}
 
 
-def _label_from_stem(stem: str) -> str:
+def label_from_stem(stem: str) -> str:
     s = stem.lower()
     if "hgb" in s or "hist" in s:
         return "HGB"
@@ -168,16 +177,16 @@ def _safe_get_setting(settings: Any, key: str, default: Any) -> Any:
 
 
 # ============================================================
-# Curve key helpers (kept from your zip)
+# Curve key helpers
 # ============================================================
 def _extract_conc_from_curve_id(curve_id: str) -> float | None:
     if curve_id is None:
         return None
     s = str(curve_id)
-    m = __import__("re").search(
+    m = re.search(
         r"\[(?:\s*Conc\s*=\s*)?([0-9]+(?:\.[0-9]+)?)\s*\]",
         s,
-        flags=__import__("re").IGNORECASE,
+        flags=re.IGNORECASE,
     )
     if not m:
         return None
@@ -210,10 +219,10 @@ def _test_id_encodes_conc(test_id: object) -> bool:
     if test_id is None:
         return False
     s = str(test_id)
-    return __import__("re").search(
+    return re.search(
         r"\[(?:\s*Conc\s*=\s*)?([0-9]+(?:\.[0-9]+)?)\s*\]",
         s,
-        flags=__import__("re").IGNORECASE,
+        flags=re.IGNORECASE,
     ) is not None
 
 
@@ -240,7 +249,7 @@ def _attach_curve_key(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# Wide -> tidy grofit (unchanged from your zip)
+# Wide -> tidy grofit
 # ============================================================
 def wide_original_to_grofit_tidy(
     wide_original: pd.DataFrame,
@@ -273,11 +282,11 @@ def wide_original_to_grofit_tidy(
 
 
 # ============================================================
-# NEW Stage-2 evidence feature computation from wide
+# Stage-2 evidence feature computation from wide
 # ============================================================
-def _get_time_cols(wide_df: pd.DataFrame) -> list[str]:
-    cols = [c for c in wide_df.columns if parse_time_from_header(str(c)) is not None]
-    return sorted(cols, key=lambda c: float(parse_time_from_header(str(c))))
+# def _get_time_cols(wide_df: pd.DataFrame) -> list[str]:
+#     cols = [c for c in wide_df.columns if parse_time_from_header(str(c)) is not None]
+#     return sorted(cols, key=lambda c: float(parse_time_from_header(str(c))))
 
 
 def _compute_stage2_features_from_wide_evidence(
@@ -290,7 +299,7 @@ def _compute_stage2_features_from_wide_evidence(
 
     Returns scalar-only columns (CSV/UI friendly).
     """
-    time_cols = _get_time_cols(wide_raw_df)
+    time_cols = get_sorted_time_columns(wide_raw_df)
     rows: list[dict[str, object]] = []
 
     for _, row_raw in wide_raw_df.iterrows():
@@ -314,6 +323,7 @@ def _compute_stage2_features_from_wide_evidence(
                 # Core evidence
                 "growth_z_like": float(ev.growth_z_like),
                 "artifact_score": float(ev.artifact_score),
+                "decline_score": float(ev.decline_score),
                 "data_quality": float(ev.data_quality),
                 "decision_confidence": float(ev.confidence),
                 # Supporting
@@ -333,29 +343,38 @@ def _assign_stage2_checker_outputs(
     out_df: pd.DataFrame,
     *,
     cfg: Stage2ConfigEvidence,
+    unsure_conf_threshold: float | None = None,
 ) -> pd.DataFrame:
     """
     Uses the evidence columns already merged into out_df to compute:
 
-      - Stage 2 Label  (checker status: Corroborated / Contradiction / Insufficient)
+      - Stage 2 Label            (checker status: Corroborated / Contradiction / Insufficient)
       - Label Reason
-      - Pred Label (final conservative label: contradiction -> Unsure, else keep Stage-1)
+      - Pred Label                (Stage-1's own call, downgraded to Unsure only by
+                                    the Stage-1 confidence gate; never touched by Stage-2)
+      - Final Label (S1+S2)       (the combined decision actually used downstream)
 
-    This gives you a thesis-defensible behavior immediately.
+    unsure_conf_threshold, when given, adds a Stage-1 confidence gate that runs
+    independently of the Stage-2 checker. It applies whenever the predicted
+    probability sits within unsure_conf_threshold of 0.5, regardless of whether
+    late-window data exists or what Stage-2 found.
     """
     stage2_labels: list[str] = []
+    pred_labels: list[str] = []
     reasons: list[str] = []
     final_labels: list[str] = []
 
     for _, row in out_df.iterrows():
         s1 = _normalize_label_text(row.get("pred_label", ""))
         s1_conf = pd.to_numeric(pd.Series([row.get("pred_confidence", np.nan)]), errors="coerce").iloc[0]
+        s1_conf_valid = pd.to_numeric(pd.Series([row.get("confidence_valid", np.nan)]), errors="coerce").iloc[0]
 
         ev = EvidenceScores(
             growth_z_like=float(pd.to_numeric(pd.Series([row.get("growth_z_like", 0.0)]), errors="coerce").iloc[0]),
             artifact_score=float(pd.to_numeric(pd.Series([row.get("artifact_score", 0.5)]), errors="coerce").iloc[0]),
             data_quality=float(pd.to_numeric(pd.Series([row.get("data_quality", 0.0)]), errors="coerce").iloc[0]),
             confidence=float(pd.to_numeric(pd.Series([row.get("decision_confidence", 0.0)]), errors="coerce").iloc[0]),
+            decline_score=float(pd.to_numeric(pd.Series([row.get("decline_score", 0.0)]), errors="coerce").iloc[0]),
             late_slope=float(pd.to_numeric(pd.Series([row.get("late_slope", np.nan)]), errors="coerce").iloc[0]),
             late_delta=float(pd.to_numeric(pd.Series([row.get("late_delta", np.nan)]), errors="coerce").iloc[0]),
             noise_level=float(pd.to_numeric(pd.Series([row.get("noise_level", np.nan)]), errors="coerce").iloc[0]),
@@ -371,27 +390,44 @@ def _assign_stage2_checker_outputs(
         )
 
         stage2_labels.append(status)
-        reasons.append(reason)
 
-        # Conservative final decision (thesis-friendly):
-        # any contradiction -> Unsure, else preserve Stage-1
-        if status == "Contradiction":
+        low_confidence = False
+        if unsure_conf_threshold is not None and np.isfinite(s1_conf_valid):
+            margin = min(float(s1_conf_valid), 1.0 - float(s1_conf_valid))
+            low_confidence = margin > float(unsure_conf_threshold)
+
+        if low_confidence:
+            label_for_reason = s1 if s1 else "Unknown"
+            pred_labels.append("Unsure")
+            reasons.append(f"S1_LOW_CONFIDENCE: Confidence({label_for_reason}) = {s1_conf_valid:.2f}")
+            final_labels.append("Unsure")
+        elif status == "Contradiction":
+            stage1_conf_for_reason = float(s1_conf) if np.isfinite(s1_conf) else float("nan")
+            label_for_reason = s1 if s1 else "Unknown"
+            pred_labels.append(s1 if s1 else "Unsure")
+            reasons.append(f"{reason}: Confidence({label_for_reason}) = {stage1_conf_for_reason:.2f}")
             final_labels.append("Unsure")
         elif status == "Insufficient":
+            pred_labels.append(s1 if s1 else "Unsure")
+            reasons.append(reason)
             final_labels.append(s1 if s1 else "Unsure")
         else:
+            pred_labels.append(s1 if s1 else "Unsure")
+            reasons.append(reason)
             final_labels.append(s1 if s1 else "Unsure")
 
     out = out_df.copy()
     out["Stage 2 Label"] = stage2_labels
     out["Label Reason"] = reasons
-    out["Pred Label"] = final_labels
-    out["final_label"] = final_labels  # keep the alias many places expect
+    out["Pred Label"] = pred_labels
+    out["Final Label (S1+S2)"] = final_labels
+    out["final_label"] = final_labels  # alias used by downstream consumers, e.g. init_review_df
+
     return out
 
 
 # ============================================================
-# Main inference function (Stage-1 same, Stage-2 replaced)
+# Main inference function
 # ============================================================
 def run_label_inference_from_uploaded_wide(
     wide_df: pd.DataFrame,
@@ -407,9 +443,10 @@ def run_label_inference_from_uploaded_wide(
     # full horizon (for Stage-2 evidence)
     wide_raw_df = _attach_curve_key(wide_df.copy())
 
-    # ---- Stage-1 pre-processing still runs on early window (your existing design) ----
-    # We keep your original approach: write early-window to temp CSV, run merge/preprocess/meta.
-    # Stage-2 ignores truncation and reads directly from wide_raw_df.
+    # ---- Stage-1 pre-processing runs on the early (0..stage2_start) window ----
+    # The early window is written to a temp CSV and passed through the same
+    # merge/preprocess/meta path used for training. Stage-2 ignores truncation
+    # and reads the full horizon directly from wide_raw_df.
     time_cols_all = [c for c in wide_raw_df.columns if parse_time_from_header(str(c)) is not None]
     non_time_cols = [c for c in wide_raw_df.columns if c not in time_cols_all]
     early_cols = [c for c in time_cols_all if float(parse_time_from_header(str(c))) <= float(stage2_start)]
@@ -425,31 +462,31 @@ def run_label_inference_from_uploaded_wide(
             out_raw=None,
             out_final=None,
             out_meta=None,
-            step=float(_safe_get_setting(settings, "step", 0.5)),
-            min_points=int(_safe_get_setting(settings, "min_points", 3)),
-            low_res_threshold=int(_safe_get_setting(settings, "low_res_threshold", 7)),
-            tmax_hours=_safe_get_setting(settings, "tmax_hours", 16.0),
-            auto_tmax=bool(_safe_get_setting(settings, "auto_tmax", False)),
-            auto_tmax_coverage=float(_safe_get_setting(settings, "auto_tmax_coverage", 0.8)),
+            # Pinned to the training configuration (TRAIN_* in build_meta_dataset)
+            # so an uploaded curve is preprocessed identically to the training set.
+            step=TRAIN_STEP_HOURS,
+            min_points=3,
+            low_res_threshold=7,
+            tmax_hours=TRAIN_TMAX_HOURS,
             blank_subtracted=True,
-            clip_negatives=bool(_safe_get_setting(settings, "clip_negatives", False)),
+            clip_negatives=False,
             global_blank=_safe_get_setting(settings, "global_blank", None),
-            blank_status_csv=None,
+            # blank_status_csv=None,
             blank_default=blank_default,
-            smooth_method=str(_safe_get_setting(settings, "smooth_method", "SGF")),
-            smooth_window=int(_safe_get_setting(settings, "smooth_window", 5)),
-            normalize=str(_safe_get_setting(settings, "normalize", "MINMAX")),
+            smooth_method=TRAIN_SMOOTH_METHOD,
+            smooth_window=TRAIN_SMOOTH_WINDOW,
+            normalize=TRAIN_NORMALIZE,
             loglevel="ERROR",
             augment_trunc=False,
         )
 
     meta_df = _attach_curve_key(meta_df)
 
-    # ---- Stage-1 model inference (unchanged) ----
+    # ---- Stage-1 model inference ----
     available_models = discover_models(model_dir)
     model_label_map: dict[str, Path] = {}
     for stem, p in available_models.items():
-        label = _label_from_stem(stem)
+        label = label_from_stem(stem)
         if label in model_label_map:
             label = f"{label}-{stem}"
         model_label_map[label] = p
@@ -470,6 +507,13 @@ def run_label_inference_from_uploaded_wide(
                 valid_probs_list.append(_labels_to_prob_valid(plabel))
         valid_probs = np.vstack(valid_probs_list)
 
+        # Ensemble weighting (known limitation, kept intentionally):
+        # Each member is weighted by its mean certainty |p - 0.5| measured
+        # over the curves in THIS request, so the weights depend on the batch
+        # uploaded together. An identical curve can therefore receive a
+        # slightly different ensemble probability depending on its companions.
+        # This is documented rather than changed, to keep inference behaviour
+        # stable across the reported experiments.
         eps = 1e-9
         p_clipped = np.clip(valid_probs, eps, 1 - eps)
         model_certainty = np.nanmean(np.abs(p_clipped - 0.5), axis=1)
@@ -510,10 +554,10 @@ def run_label_inference_from_uploaded_wide(
     out_df["confidence_invalid"] = np.round(1 - final_prob, 4)
     out_df["is_valid_pred"] = out_df["pred_label"].map(_label_is_valid).astype(bool)
 
-    out_df["Predicted S1 Label"] = out_df["pred_label"].astype(str)
+    # out_df["Predicted S1 Label"] = out_df["pred_label"].astype(str)
     out_df["S1 Confidence Valid"] = out_df["confidence_valid"]
 
-    # ---- NEW Stage-2 evidence computation ----
+    # ---- Stage-2 evidence computation ----
     stage2_cfg = Stage2ConfigEvidence(stage2_start=float(stage2_start))
 
     stage2_df = _compute_stage2_features_from_wide_evidence(wide_raw_df, cfg=stage2_cfg)
@@ -525,7 +569,7 @@ def run_label_inference_from_uploaded_wide(
     )
 
     # Checker outputs + conservative final label
-    out_df = _assign_stage2_checker_outputs(out_df, cfg=stage2_cfg)
+    out_df = _assign_stage2_checker_outputs(out_df, cfg=stage2_cfg, unsure_conf_threshold=unsure_conf_threshold)
 
     # Authoritative sparse override: sparse curves can never remain Valid.
     too_sparse_mask = pd.to_numeric(out_df.get("too_sparse", False), errors="coerce").fillna(0).astype(int).eq(1)

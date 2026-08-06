@@ -9,19 +9,18 @@ import pandas as pd
 
 from growthqa.classifier.train_from_meta import _group_split, build_model_matrix, detect_label_col
 from growthqa.pipelines.build_meta_dataset import run_merge_preprocess_meta
-from growthqa.preprocess.timegrid import parse_time_from_header
+from growthqa.preprocess.timegrid import parse_time_from_header, get_time_columns
 
 
-def _time_cols(df: pd.DataFrame) -> list[str]:
-    return [c for c in df.columns if parse_time_from_header(str(c)) is not None]
+# def _time_cols(df: pd.DataFrame) -> list[str]:
+#     return [c for c in df.columns if parse_time_from_header(str(c)) is not None]
 
 
 def run_validation(inputs: list[str]) -> None:
     with tempfile.TemporaryDirectory() as td:
         out_raw = Path(td) / "raw.csv"
         out_final = Path(td) / "final.csv"
-        out_meta = Path(td) / "meta.csv"
-        # out_meta = Path(td) / "metaNoGrofit.csv"
+        out_meta = Path(td) / "training_meta.csv"
 
         raw, final, meta = run_merge_preprocess_meta(
             inputs=inputs,
@@ -30,14 +29,13 @@ def run_validation(inputs: list[str]) -> None:
             out_meta=str(out_meta),
             step=0.5,
             tmax_hours=16.0,
-            auto_tmax=False,
             augment_trunc=True,
             trunc_horizons=[8.0, 10.0, 12.0, 14.75, 16.0],
             trunc_per_curve=3,
             trunc_seed=123,
         )
 
-        assert out_meta.exists(), "meta.csv was not created"
+        assert out_meta.exists(), "training_meta.csv was not created"
         required = [
             "FileName",
             "Test Id",
@@ -64,17 +62,14 @@ def run_validation(inputs: list[str]) -> None:
             "net_change_per_hour",
         ]
         missing = [c for c in required if c not in meta.columns]
-        assert not missing, f"meta.csv missing required columns: {missing}"
+        assert not missing, f"training_meta.csv missing required columns: {missing}"
 
-        tcols_raw = _time_cols(raw)
-        tvals_raw = np.array([parse_time_from_header(c) for c in tcols_raw], dtype=float)
-        h10 = raw[pd.to_numeric(raw["train_horizon"], errors="coerce") == 10.0]
-        if not h10.empty:
-            mask = tvals_raw > 10.0
-            assert h10.loc[:, np.array(tcols_raw)[mask]].isna().all().all(), "Rows with train_horizon=10 have non-NaN points >10h"
-
-        tcols_final = _time_cols(final)
+        tcols_final = get_time_columns(final)
         tvals_final = np.array([parse_time_from_header(c) for c in tcols_final], dtype=float)
+        h10 = final[pd.to_numeric(final["train_horizon"], errors="coerce") == 10.0]
+        if not h10.empty:
+            mask = tvals_final > 10.0
+            assert h10.loc[:, np.array(tcols_final)[mask]].isna().all().all(), "Rows with train_horizon=10 have non-NaN points >10h"
         final_indexed = final.set_index("aug_id", drop=False)
         for _, r in meta.head(200).iterrows():
             aid = r.get("aug_id")
@@ -117,4 +112,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

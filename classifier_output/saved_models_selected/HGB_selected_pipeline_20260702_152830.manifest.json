@@ -1,0 +1,19 @@
+{
+  "created_at": "2026-07-02T15:28:31",
+  "python_version": "3.11.0",
+  "sklearn_version": "1.2.0",
+  "numpy_version": "1.23.5",
+  "joblib_version": "1.2.0",
+  "model_file": "HGB_selected_pipeline_20260702_152830.joblib",
+  "feature_columns": [
+    "observed_tmax",
+    "net_change_per_hour",
+    "max_slope",
+    "lag_time_est",
+    "monotonicity_fraction",
+    "largest_drop_frac",
+    "roughness",
+    "final_to_peak_ratio"
+  ],
+  "group_split_col": "base_curve_id"
+}

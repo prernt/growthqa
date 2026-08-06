@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-import argparse
-import logging
-import os
-import re
-import warnings
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List
 
 import numpy as np
 import pandas as pd
 
-from growthqa.preprocess.timegrid import build_common_grid, choose_auto_tmax, get_time_columns, make_header_from_times, parse_time_from_header
+from growthqa.io.wide_loader import REQUIRED_META_COLS
+from growthqa.preprocess.timegrid import (
+    build_common_grid,
+    get_time_columns,
+    make_header_from_times,
+    parse_time_from_header,
+)
 
-REQUIRED_META_COLS = ["FileName", "Test Id", "Model Name", "Is_Valid"]
 
 def _get_meta_cols(df_wide: pd.DataFrame) -> List[str]:
     cols = list(REQUIRED_META_COLS)
@@ -60,7 +59,6 @@ def interpolate_linear_no_extrap(t_src: np.ndarray, y_src: np.ndarray, t_grid: n
     if t.size < 2:
         return np.full_like(t_grid, np.nan, dtype=float)
 
-    # sort
     order = np.argsort(t)
     t = t[order]
     y = y[order]
@@ -90,18 +88,12 @@ def interpolate_linear_no_extrap(t_src: np.ndarray, y_src: np.ndarray, t_grid: n
 def build_raw_merged(df_all_wide: pd.DataFrame,
                      step_hours: float,
                      min_points: int,
-                     tmax_hours: Optional[float],
-                     auto_tmax: bool,
-                     auto_tmax_coverage: float,
+                     tmax_hours: float,
                      low_res_threshold: int) -> pd.DataFrame:
+    """Interpolate every original curve onto the canonical 0..tmax grid."""
     long = wide_to_long(df_all_wide)
-    all_times = long["time_h"].dropna().astype(float).to_numpy()
 
-    eff_tmax = tmax_hours
-    if auto_tmax:
-        eff_tmax = choose_auto_tmax(long, coverage=auto_tmax_coverage, user_cap=tmax_hours)
-
-    t_grid = build_common_grid(all_times, step_hours=step_hours, tmax_hours=eff_tmax)
+    t_grid = build_common_grid(step_hours=step_hours, tmax_hours=tmax_hours)
     time_headers = make_header_from_times(t_grid)
 
     rows = []
@@ -134,4 +126,3 @@ def build_raw_merged(df_all_wide: pd.DataFrame,
 
     cols = meta_cols + ["too_sparse", "low_resolution"] + time_headers
     return pd.DataFrame(rows)[cols]
-

@@ -4,15 +4,12 @@ from typing import Optional, Iterable
 import numpy as np
 import pandas as pd
 
-from growthqa.preprocess.timegrid import parse_time_from_header
+from growthqa.preprocess.timegrid import parse_time_from_header, get_time_columns
 from growthqa.grofit.gc_fit_spline import gc_fit_spline
 from growthqa.grofit.gc_fit_model import gc_fit_model
 from growthqa.grofit.dr_fit_spline import dr_fit_spline
 from growthqa.grofit.parametric_models import get_model_specs, extract_grofit_params_from_curve
 
-
-def _time_cols(df: pd.DataFrame) -> list[str]:
-    return [c for c in df.columns if parse_time_from_header(str(c)) is not None]
 
 
 def _extract_series(row: pd.Series, time_cols: list[str]) -> tuple[np.ndarray, np.ndarray]:
@@ -144,8 +141,11 @@ def build_curve_payloads(
     curve_ids: Optional[Iterable[str]] = None,
 ) -> dict[str, dict]:
     payloads: dict[str, dict] = {}
-    raw_time_cols = _time_cols(raw_wide)
-    proc_time_cols = _time_cols(proc_wide)
+    # raw_time_cols = _time_cols(raw_wide)
+    # proc_time_cols = _time_cols(proc_wide)
+    raw_time_cols = get_time_columns(raw_wide)
+    proc_time_cols = get_time_columns(proc_wide)
+
 
     label_map = labels_df.set_index("Test Id")
     curve_ids_set = set(curve_ids) if curve_ids is not None else None

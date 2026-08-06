@@ -25,7 +25,7 @@ for _cand in {ROOT, ROOT / "src", Path.cwd(), Path.cwd() / "src"}:
 # Well-known paths
 # ---------------------------------------------------------------------------
 MODEL_DIR  = ROOT / "classifier_output" / "saved_models_selected"
-TRAIN_META = ROOT / "data" / "train_data" / "meta.csv"
+TRAIN_META = ROOT / "data" / "train_data" / "training_meta.csv"
 
 
 # ---------------------------------------------------------------------------

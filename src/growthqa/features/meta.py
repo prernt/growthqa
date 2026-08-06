@@ -67,73 +67,11 @@ def _time_cols_from_row(row: pd.Series) -> List[str]:
     return sorted(cols, key=lambda c: parse_time_from_header(str(c)) or 0.0)
 
 
-# def compute_late_growth_features(times: np.ndarray, ods: np.ndarray, start: float = 16.0) -> Dict[str, object]:
-#     t = np.array(times, dtype=float)
-#     y = np.array(ods, dtype=float)
-#     finite = np.isfinite(t) & np.isfinite(y)
-#     t = t[finite]
-#     y = y[finite]
-
-#     out = {
-#         "has_late_data": 0,
-#         "late_window_start": float(start),
-#         "late_tmax": np.nan,
-#         "late_n_points": 0,
-#         "late_slope": np.nan,
-#         "late_delta": np.nan,
-#         "late_max_increase": np.nan,
-#         "late_growth_detected": 0,
-#     }
-#     if t.size == 0:
-#         return out
-
-#     order = np.argsort(t)
-#     t = t[order]
-#     y = y[order]
-
-#     late = t > float(start)
-#     if not np.any(late):
-#         return out
-
-#     t_l = t[late]
-#     y_l = y[late]
-#     out["has_late_data"] = 1
-#     out["late_tmax"] = float(np.nanmax(t_l))
-#     out["late_n_points"] = int(t_l.size)
-
-#     if t_l.size >= 2:
-#         dt = np.diff(t_l)
-#         dy = np.diff(y_l)
-#         good = dt > 1e-12
-#         if np.any(good):
-#             slopes = dy[good] / dt[good]
-#             out["late_slope"] = float(np.nanmedian(slopes))
-
-#     ref = (t >= float(start)) & (t <= float(start + 2.0))
-#     if np.any(ref):
-#         ref_med = float(np.nanmedian(y[ref]))
-#         k = max(1, int(np.ceil(0.2 * y_l.size)))
-#         tail_med = float(np.nanmedian(y_l[-k:]))
-#         out["late_delta"] = float(tail_med - ref_med)
-
-#     od_at_start = np.nan
-#     if t.size >= 2 and np.nanmin(t) <= float(start) <= np.nanmax(t):
-#         od_at_start = float(np.interp(float(start), t, y))
-#     if np.isfinite(od_at_start):
-#         out["late_max_increase"] = float(np.nanmax(y_l) - od_at_start)
-
-#     slope_thr = 0.01
-#     delta_thr = 0.03
-#     inc_thr = 0.05
-#     grow = False
-#     if np.isfinite(out["late_slope"]) and out["late_slope"] > slope_thr:
-#         grow = True
-#     if np.isfinite(out["late_delta"]) and out["late_delta"] > delta_thr:
-#         grow = True
-#     if np.isfinite(out["late_max_increase"]) and out["late_max_increase"] > inc_thr:
-#         grow = True
-#     out["late_growth_detected"] = int(grow)
-#     return out
+# Late-window growth features (observations beyond the 16 h training horizon) are
+# not produced here. Stage 1 is trained only on the 0-16 h window, so these values
+# are constant within training_meta.csv and carry no signal for the classifier. The live
+# late-window analysis used at inference belongs to Stage 2 and is implemented in
+# growthqa.stage2.late_window.
 
 
 def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dict[str, object]:
@@ -185,7 +123,6 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
         is_censored = int(float(train_horizon) < 16.0 - 1e-9)
 
     if t.size == 0:
-        # late = compute_late_growth_features(t_all, y_all, start=16.0)
         return {
             "train_horizon": float(train_horizon),
             "observed_tmax": observed_tmax,
@@ -212,13 +149,11 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
             "dip_fraction": np.nan,
             "roughness": np.nan,
             "noise_residual_std": np.nan,
-            "lag_time": np.nan,
             "lag_time_est": np.nan,
             "plateau_OD": np.nan,
             "growth_phase_duration": np.nan,
             "symmetry_factor": np.nan,
             "final_to_peak_ratio": np.nan,
-            "time_to_peak": np.nan,
             "num_slope_sign_changes": np.nan,
             "multi_phase_flag": np.nan,
             "logistic_fit_mse": np.nan,
@@ -228,7 +163,6 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
             "flat_AIC": np.nan,
             "best_model_AIC": np.nan,
             "best_model_name": np.nan,
-            # **late,
         }
 
     order = np.argsort(t)
@@ -374,8 +308,6 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
             best_model_name = min(finite_aics, key=finite_aics.get)
             best_model_AIC = float(finite_aics[best_model_name])
 
-    # late = compute_late_growth_features(t_all, y_all, start=16.0)
-
     return {
         "train_horizon": float(train_horizon),
         "observed_tmax": observed_tmax,
@@ -402,13 +334,11 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
         "dip_fraction": dip_fraction,
         "roughness": roughness,
         "noise_residual_std": noise_residual_std,
-        "lag_time": lag_time,
         "lag_time_est": lag_time,
         "plateau_OD": plateau_od,
         "growth_phase_duration": growth_phase_duration,
         "symmetry_factor": symmetry_factor,
         "final_to_peak_ratio": final_to_peak_ratio,
-        "time_to_peak": time_of_max_od,
         "num_slope_sign_changes": num_slope_sign_changes,
         "multi_phase_flag": int(bool(multi_phase_flag)),
         "logistic_fit_mse": logistic_fit_mse,
@@ -418,7 +348,6 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
         "flat_AIC": flat_AIC,
         "best_model_AIC": best_model_AIC,
         "best_model_name": best_model_name,
-        # **late,
     }
 
 

@@ -7,15 +7,8 @@ from typing import Iterable, List
 import numpy as np
 import pandas as pd
 
-from growthqa.preprocess.timegrid import parse_time_from_header
-
+from growthqa.preprocess.timegrid import parse_time_from_header, get_sorted_time_columns
 _FULL_HORIZON_DEFAULT = 16.0
-
-
-def _time_cols(df: pd.DataFrame) -> List[str]:
-    cols = [c for c in df.columns if parse_time_from_header(str(c)) is not None]
-    return sorted(cols, key=lambda c: float(parse_time_from_header(str(c)) or 0.0))
-
 
 def _time_values(time_cols: Iterable[str]) -> np.ndarray:
     return np.array([parse_time_from_header(str(c)) for c in time_cols], dtype=float)
@@ -150,7 +143,8 @@ def augment_df(
     seed: int = 123,
     full_horizon: float = _FULL_HORIZON_DEFAULT,
 ) -> pd.DataFrame:
-    time_cols = _time_cols(df_wide)
+     
+    time_cols = get_sorted_time_columns(df_wide)
     grid_times = _time_values(time_cols)
     if not time_cols:
         out = df_wide.copy()

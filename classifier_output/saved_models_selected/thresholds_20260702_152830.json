@@ -1,0 +1,5 @@
+{
+  "valid_th": 0.7,
+  "invalid_th": 0.3,
+  "proba_positive_class": "valid(1)"
+}

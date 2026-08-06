@@ -1,4 +1,4 @@
-# app/core/plots.py
+# app/plots.py
 """
 All Plotly figure-building functions.
 No Streamlit dependency — returns go.Figure objects only.
@@ -54,31 +54,6 @@ def generate_fast_bootstrap_bands(
         return np.percentile(arr, 2.5, axis=0), np.percentile(arr, 97.5, axis=0)
     except Exception:
         return None, None
-
-
-# ---------------------------------------------------------------------------
-# Simple single-series plot (used in training/debug views)
-# ---------------------------------------------------------------------------
-
-def make_simple_plot(df_one: pd.Series, time_cols: list[str], title: str) -> go.Figure:
-    xs, ys = [], []
-    for c in time_cols:
-        try:
-            xs.append(float(c.split("(")[0].strip()[1:].strip()))
-            ys.append(df_one.get(c, np.nan))
-        except Exception:
-            continue
-    order = np.argsort(xs) if xs else []
-    xs = np.array(xs)[order] if xs else np.array([])
-    ys = np.array(ys)[order] if ys else np.array([])
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers"))
-    fig.update_layout(
-        title=title, xaxis_title="Time (hours)",
-        yaxis_title="Relative OD (normalized)",
-        height=420, margin=dict(l=30, r=10, t=50, b=40),
-    )
-    return fig
 
 
 # ---------------------------------------------------------------------------

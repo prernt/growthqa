@@ -1,4 +1,4 @@
-# app/ui/sidebar.py
+# app/sidebar.py
 """
 Top-of-page controls: file upload, mode radio, run/train buttons,
 auto-mode selectors, filter expander, and sample download buttons.
@@ -10,8 +10,8 @@ from pathlib import Path
 
 import streamlit as st
 
-from config import GrofitOptions, InferenceSettings, MODEL_DIR, TRAIN_META
-from utils import make_sample_wide_csv_bytes, make_sample_long_csv_bytes, safe_float
+from config import GrofitOptions, InferenceSettings, MODEL_DIR
+from utils import make_sample_wide_csv_bytes, make_sample_long_csv_bytes, safe_float, normalize_bootstrap_method
 from model_io import has_trained_models, discover_models, label_from_stem
 
 
@@ -186,7 +186,6 @@ def render_top_controls() -> dict:
                 dr_x_transform = None if dr_x_transform == "OFF" else dr_x_transform,
                 dr_y_transform = None if dr_y_transform == "OFF" else dr_y_transform,
             )
-            from utils import normalize_bootstrap_method
             grofit_opts.bootstrap_method = normalize_bootstrap_method(grofit_opts.bootstrap_method)
 
         st.session_state["grofit_opts"] = grofit_opts

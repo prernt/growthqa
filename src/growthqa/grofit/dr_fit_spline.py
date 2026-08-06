@@ -5,11 +5,10 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 from scipy.interpolate import make_smoothing_spline
-from scipy.linalg import svd
 
 from .dr_fit_model import dr_fit_model
 from .parametric_models import aic_from_rss
-from .gc_fit_spline import effective_df, _find_bounded_lambda, DR_MIN_DF,spar_to_lam
+from .gc_fit_spline import effective_df, DR_MIN_DF, spar_to_lam, _select_lam_and_fit
 
 
 # ---------------------------------------------------------------------------
@@ -89,149 +88,9 @@ def _pick_ec50_crossing(
     best_idx = int(np.nanargmax(slopes))
     return float(roots[best_idx][0]), "MULTI_STEEPEST"
 
-
-# def _effective_df(sp, x: np.ndarray) -> float:
-#     """
-#     Estimate effective degrees of freedom of the fitted spline by computing
-#     trace(H) where H is the hat/influence matrix evaluated at the knot points.
-
-#     This mirrors R's smooth.spline df computation and lets us detect when
-#     GCV has over-smoothed to near-linear (df ≈ 2 means straight line).
-
-#     For a cubic smoothing spline, df = trace(S) where S maps y → fitted values.
-#     We approximate this via the sum of squared basis evaluations (fast proxy).
-#     """
-#     try:
-#         # Evaluate the spline and its derivative on a fine grid at x locations.
-#         # A flat spline has nearly constant derivative → very low effective df.
-#         # We use the ratio of curvature variance to derivative variance as proxy.
-#         y_fit = sp(x)
-#         dy = sp.derivative(1)(x)
-#         d2y = sp.derivative(2)(x)
-
-#         # Ratio of second derivative energy to first derivative energy.
-#         # For a straight line: d2y ≈ 0 → ratio ≈ 0 → df_proxy ≈ 2.
-#         # For a sigmoid: d2y has two peaks → ratio is large → df_proxy > 3.
-#         e1 = float(np.sum(dy ** 2))
-#         e2 = float(np.sum(d2y ** 2))
-#         if e1 < 1e-20:
-#             return 2.0
-#         # Heuristic that maps curvature ratio to df on [2, n]:
-#         # df ≈ 2 + log1p(e2/e1 * n)
-#         n = float(len(x))
-#         df_proxy = 2.0 + np.log1p(e2 / e1 * n)
-#         return float(np.clip(df_proxy, 2.0, n))
-#     except Exception:
-#         return 2.0  # safe fallback: assume straight line if computation fails
-
-
-# def _find_bounded_lambda(
-#     xt: np.ndarray,
-#     y: np.ndarray,
-#     min_df: float = 3.5,
-#     n_search: int = 30,
-# ) -> float:
-#     """
-#     Find the largest lambda (smoothest spline) that still achieves at least
-#     min_df effective degrees of freedom. This replicates R smooth.spline's
-#     implicit df floor that prevents GCV from collapsing to a straight line
-#     on sparse dose-response data.
-
-#     Strategy: binary search on log(lambda) between a very tight lambda
-#     (rough, df ≈ n) and a very loose lambda (smooth, df ≈ 2). Return the
-#     largest lambda where df >= min_df.
-#     """
-#     n = len(xt)
-
-#     # Bracket: lam_lo → df near n (wiggly), lam_hi → df near 2 (flat)
-#     lam_lo = 1e-12
-#     lam_hi = 1e6
-
-#     # Quick check: does even the tightest lambda give enough df?
-#     try:
-#         sp_test = make_smoothing_spline(xt, y, lam=lam_lo)
-#         df_lo = _effective_df(sp_test, xt)
-#     except Exception:
-#         df_lo = float(n)
-
-#     if df_lo < min_df:
-#         # Data is too sparse/flat to achieve min_df even when very wiggly.
-#         # Return tightest lambda and accept the result.
-#         return lam_lo
-
-#     # Binary search for the crossover point where df drops below min_df.
-#     for _ in range(n_search):
-#         lam_mid = np.exp(0.5 * (np.log(max(lam_lo, 1e-15)) + np.log(max(lam_hi, 1e-15))))
-#         try:
-#             sp_mid = make_smoothing_spline(xt, y, lam=lam_mid)
-#             df_mid = _effective_df(sp_mid, xt)
-#         except Exception:
-#             df_mid = 2.0
-
-#         if df_mid >= min_df:
-#             lam_lo = lam_mid   # can go smoother (larger lambda) and still meet df floor
-#         else:
-#             lam_hi = lam_mid   # too smooth, need tighter lambda
-
-#     # Return the smoothest lambda that still meets the df floor.
-#     return float(np.exp(0.5 * (np.log(max(lam_lo, 1e-15)) + np.log(max(lam_hi, 1e-15)))))
-
-
-# def _select_lambda(
-#     xt: np.ndarray,
-#     y: np.ndarray,
-#     lam: Optional[float],
-#     auto_cv: bool,
-#     min_df: float = 3.5,
-# ) -> tuple[float, str]:
-#     """
-#     Central lambda selection logic — mirrors R smooth.spline behaviour:
-
-#     1. If user provides explicit lam → use it directly (no CV).
-#     2. If auto_cv=True and lam=None → attempt GCV via SciPy (lam=None).
-#        Then check effective df. If df < min_df (GCV over-smoothed to line),
-#        fall back to bounded binary search that enforces df >= min_df.
-#     3. If auto_cv=False and lam=None → use variance-scaled deterministic
-#        fallback (avoids GCV instability on very sparse data).
-
-#     Returns (lam_fit, selection_method_label).
-#     """
-#     n = len(xt)
-
-#     # --- Case 1: explicit user lambda ---
-#     if lam is not None:
-#         return float(max(float(lam), 0.0)), "user"
-
-#     # --- Case 2: GCV with df floor (Grofit R-like behaviour) ---
-#     if auto_cv:
-#         try:
-#             sp_gcv = make_smoothing_spline(xt, y, lam=None)
-#             df_gcv = _effective_df(sp_gcv, xt)
-
-#             if df_gcv >= min_df:
-#                 # GCV gave a biologically sensible smoothness → use it.
-#                 # Recover the lambda SciPy chose by back-solving (it doesn't
-#                 # expose lam directly, so we approximate from the spline).
-#                 # We just reuse the spline object and return lam=None sentinel.
-#                 return float("nan"), "gcv_ok"   # sentinel: caller uses sp_gcv
-#             else:
-#                 # GCV over-smoothed (sparse data problem). Fall back to
-#                 # bounded search that enforces df >= min_df.
-#                 lam_bounded = _find_bounded_lambda(xt, y, min_df=min_df)
-#                 return lam_bounded, "gcv_bounded"
-
-#         except Exception:
-#             # GCV itself failed → fall through to deterministic fallback.
-#             pass
-
-#     # --- Case 3: deterministic fallback ---
-#     # Data-variance-scaled lambda. Robust for very sparse/noisy datasets.
-#     lam_fallback = float(max(np.nanvar(y) * max(n, 1), 1e-10))
-#     return lam_fallback, "fallback"
-
 def _select_lambda(xt, y, lam, auto_cv, min_df=DR_MIN_DF):
     """Thin wrapper using the shared GC/DR lambda selection logic (item 2)."""
-    from .gc_fit_spline import _select_lam_and_fit
+    
     sp, lam_used, method = _select_lam_and_fit(xt, y, lam=lam, auto_cv=auto_cv, min_df=min_df)
     return sp, lam_used, method
 

@@ -4,8 +4,6 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, Literal
 import numpy as np
 
-ParametricModelName = Literal["logistic", "gompertz", "modified_gompertz", "richards"]
-
 @dataclass
 class FitResult:
     method: Literal["parametric", "spline"]

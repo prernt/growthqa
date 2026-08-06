@@ -28,8 +28,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 from growthqa.classifier.save_manifest import write_model_manifest
 
 ROOT = Path(__file__).resolve().parents[3]
-TRAIN_META_CSV = ROOT / "data" / "train_data" / "meta.csv"
-# TRAIN_META_CSV = ROOT / "data" / "output" / "metaNoGrofit.csv"
+TRAIN_META_CSV = ROOT / "data" / "train_data" / "training_meta.csv"
 ART_DIR = ROOT / "classifier_output" / "saved_models_selected"
 LOCKFILE_OUT = ROOT / "classifier_output" / "requirements_lock.txt"
 
@@ -51,6 +50,26 @@ NOTEBOOK_STAGE1_CUSTOM_FEATURES = [
     "final_to_peak_ratio",
 ]
 
+# Reduced Stage-1 feature set (8 features). Derived from the notebook set by
+# removing the two columns that added the least separable information:
+#   - auc_per_hour: weak univariate signal and overlaps net_change_per_hour.
+#   - dip_fraction: near-duplicate of largest_drop_frac (Spearman ~0.96).
+# The remaining eight cover distinct aspects of curve shape: observation
+# horizon, average growth rate, peak growth rate, lag onset, monotonicity,
+# largest single drop, high-frequency roughness and final-to-peak level.
+# Held-out balanced accuracy and ROC-AUC match the 10-feature set within
+# run-to-run variation.
+STAGE1_SELECTED_FEATURES = [
+    "observed_tmax",
+    "net_change_per_hour",
+    "max_slope",
+    "lag_time_est",
+    "monotonicity_fraction",
+    "largest_drop_frac",
+    "roughness",
+    "final_to_peak_ratio",
+]
+
 IDENTIFIER_COLS = {
     "FileName",
     "Test Id",
@@ -59,7 +78,7 @@ IDENTIFIER_COLS = {
     "base_curve_id",
     "aug_id",
 }
-LEAKAGE_COLS = {"meta_label", "best_model_name"}
+LEAKAGE_COLS = {"best_model_name"}
 
 
 def normalize_label(series: pd.Series) -> pd.Series:
@@ -91,7 +110,7 @@ def detect_label_col(df: pd.DataFrame) -> str:
     for c in ["Is_Valid", "is_valid", "label", "y", "_y"]:
         if c in df.columns:
             return c
-    raise ValueError("Could not find label column in meta.csv")
+    raise ValueError("Could not find label column in training_meta.csv")
 
 
 def build_model_matrix(meta: pd.DataFrame, label_col: str) -> Tuple[pd.DataFrame, pd.Series, pd.Series, List[str], pd.DataFrame]:
@@ -291,7 +310,7 @@ def train_from_meta_csv(
         missing = [c for c in selected_features if c not in X.columns]
         if missing:
             raise ValueError(
-                "Selected training features are missing from meta.csv: "
+                "Selected training features are missing from training_meta.csv: "
                 + ", ".join(missing)
             )
         X = X[selected_features].copy()

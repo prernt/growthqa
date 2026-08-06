@@ -1,12 +1,7 @@
 from __future__ import annotations
 
-import argparse
-import logging
-import os
-import re
 import warnings
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -17,7 +12,7 @@ from growthqa.preprocess.timegrid import parse_time_from_header
 HAS_SCIPY = False
 _HAS_STATSMODELS = False
 try:
-    from scipy.optimize import curve_fit, OptimizeWarning  # type: ignore
+    from scipy.optimize import OptimizeWarning  # type: ignore
     warnings.filterwarnings("ignore", category=OptimizeWarning)
     _HAS_SCIPY = True
 except Exception:
@@ -183,8 +178,7 @@ def preprocess_wide(raw_wide: pd.DataFrame,
                     clip_negatives: bool,
                     blank_status_map: Dict[str, Dict[str, object]],
                     blank_default: str,
-                    normalize_mode: str) -> Tuple[pd.DataFrame, pd.Series]:
-    # adjust blank_subtracted per-file if needed
+                    normalize_mode: str) -> pd.DataFrame:
 
     if blank_status_map is None:
         blank_status_map = {}
@@ -211,19 +205,10 @@ def preprocess_wide(raw_wide: pd.DataFrame,
     t_grid = np.array([parse_time_from_header(c) for c in time_cols], dtype=float)
 
     out = raw_wide.copy()
-    had_outliers = []
 
-    # outlier flagging (light): count extreme z points after baseline (doesn't modify)
     for i in range(len(out)):
         y = pd.to_numeric(out.loc[i, time_cols], errors="coerce").to_numpy(dtype=float)
 
-        # baseline correction first (for meaningful z-score)
-        # y0 = baseline_correct_curve(
-        #     y,
-        #     blank_subtracted=blank_subtracted,
-        #     global_blank=global_blank,
-        #     clip_negatives=bool(clip_negatives),
-        # )
         fname = str(out.loc[i, "FileName"]).strip()
 
         # Determine per-file rule
@@ -253,20 +238,6 @@ def preprocess_wide(raw_wide: pd.DataFrame,
             baseline_n_points=5,
         )
 
-
-
-        # outlier heuristic (flag only)
-        m = np.isfinite(y0)
-        flag = False
-        if np.sum(m) >= 8:
-            mu = float(np.nanmean(y0[m]))
-            sd = float(np.nanstd(y0[m]))
-            if sd > 1e-12:
-                z = np.abs((y0[m] - mu) / sd)
-                flag = bool(np.any(z > 6.0))
-        had_outliers.append(flag)
-
-        # now apply preprocessing
         # Apply transformations strictly on observed points to avoid borrowing
         # any information from NaN tails beyond the observed horizon.
         y3 = y0.copy()
@@ -280,8 +251,5 @@ def preprocess_wide(raw_wide: pd.DataFrame,
 
         out.loc[i, time_cols] = y3
 
-    out["had_outliers"] = pd.Series(had_outliers, index=out.index).astype(bool)
-
-    # keep had_outliers adjacent to flags
-    cols = meta_cols + ["had_outliers"] + time_cols
-    return out[cols], out["had_outliers"]
+    cols = meta_cols + time_cols
+    return out[cols]

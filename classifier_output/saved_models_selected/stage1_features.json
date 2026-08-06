@@ -1,0 +1,10 @@
+[
+  "observed_tmax",
+  "net_change_per_hour",
+  "max_slope",
+  "lag_time_est",
+  "monotonicity_fraction",
+  "largest_drop_frac",
+  "roughness",
+  "final_to_peak_ratio"
+]

@@ -160,7 +160,7 @@ def build_export_zip(
 ) -> tuple[str, bytes]:
 
     # zip_name= f"{mode_label}_{datetime.now().strftime('%m.%d.%y')}_{file_stem}.zip"
-    date_tag= datetime.now().strftime("%m.%d.%y")
+    date_tag= datetime.now().strftime("%d.%m.%y")
     results_name= f"{mode_label}_{date_tag}_{file_stem}.zip"
     auditing_name= f"{mode_label}_{date_tag}_{file_stem}_Auditing.zip"
 

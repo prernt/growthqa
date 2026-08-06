@@ -4,7 +4,7 @@ Quick-start guide to regenerate the GrowthQA classifier training dataset.
 
 ## Synthetic dataset contents
 
-`timeseries_wide_SD1.csv` — 900 curves, grid 0–16 h @ 0.5 h, seed 123, 11 subtypes:
+`timeseries_wide_SD1.csv` - 900 curves, grid 0–16 h @ 0.5 h, seed 123, 11 subtypes:
 
 | Valid (503) | n   | Invalid (397) | n   |
 | ---         | --- | ---           | --- |
@@ -16,7 +16,7 @@ Quick-start guide to regenerate the GrowthQA classifier training dataset.
 |             |     | noise         | 45  |
 |             |     | nogrowth      | 42  |
 
-Valid families: Logistic, Gompertz, ModifiedGompertz, Richards, decline
+Valid families: Logistic, Gompertz, BoundedModifiedGompertz, Richards, decline
 (growth + death phase). Invalid families: diauxic (two growth phases),
 obvious (mid-curve crash), subtle (localized artifact), nearreal (suppressed
 plateau), decline_only (decay only), noise (no usable signal), nogrowth

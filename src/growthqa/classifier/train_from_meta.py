@@ -26,59 +26,19 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
 
 from growthqa.classifier.save_manifest import write_model_manifest
-
-ROOT = Path(__file__).resolve().parents[3]
-TRAIN_META_CSV = ROOT / "data" / "train_data" / "training_meta.csv"
-ART_DIR = ROOT / "classifier_output" / "saved_models_selected"
-LOCKFILE_OUT = ROOT / "classifier_output" / "requirements_lock.txt"
-
-RANDOM_STATE = 42
+from growthqa.config import (
+    ROOT,
+    TRAIN_META_CSV,
+    MODEL_DIR as ART_DIR,
+    LOCKFILE_OUT,
+    RANDOM_STATE,
+    STAGE1_FEATURE_GROUPS,
+    STAGE1_CANDIDATE_POOL,
+    STAGE1_SELECTED_FEATURES,
+    IDENTIFIER_COLS,
+    LEAKAGE_COLS,
+)
 np.random.seed(RANDOM_STATE)
-
-# Notebook-selected Stage-1 custom feature set from:
-# Stage1_Feature_Exploration_Selection_Training_v2.ipynb (PICK_MODE="CUSTOM")
-NOTEBOOK_STAGE1_CUSTOM_FEATURES = [
-    "observed_tmax",
-    "auc_per_hour",
-    "net_change_per_hour",
-    "max_slope",
-    "lag_time_est",
-    "dip_fraction",
-    "largest_drop_frac",
-    "monotonicity_fraction",
-    "roughness",
-    "final_to_peak_ratio",
-]
-
-# Reduced Stage-1 feature set (8 features). Derived from the notebook set by
-# removing the two columns that added the least separable information:
-#   - auc_per_hour: weak univariate signal and overlaps net_change_per_hour.
-#   - dip_fraction: near-duplicate of largest_drop_frac (Spearman ~0.96).
-# The remaining eight cover distinct aspects of curve shape: observation
-# horizon, average growth rate, peak growth rate, lag onset, monotonicity,
-# largest single drop, high-frequency roughness and final-to-peak level.
-# Held-out balanced accuracy and ROC-AUC match the 10-feature set within
-# run-to-run variation.
-STAGE1_SELECTED_FEATURES = [
-    "observed_tmax",
-    "net_change_per_hour",
-    "max_slope",
-    "lag_time_est",
-    "monotonicity_fraction",
-    "largest_drop_frac",
-    "roughness",
-    "final_to_peak_ratio",
-]
-
-IDENTIFIER_COLS = {
-    "FileName",
-    "Test Id",
-    "Model Name",
-    "Concentration",
-    "base_curve_id",
-    "aug_id",
-}
-LEAKAGE_COLS = {"best_model_name"}
 
 
 def normalize_label(series: pd.Series) -> pd.Series:
@@ -136,29 +96,56 @@ def build_model_matrix(meta: pd.DataFrame, label_col: str) -> Tuple[pd.DataFrame
             X[c] = pd.to_numeric(X[c], errors="coerce")
 
     X = X.select_dtypes(include=[np.number]).copy()
+
+    pool_cols = [c for c in STAGE1_CANDIDATE_POOL if c in X.columns]
+    missing_pool_cols = [c for c in STAGE1_CANDIDATE_POOL if c not in X.columns]
+    if missing_pool_cols:
+        raise ValueError(
+            "training_meta.csv is missing expected Stage 1 candidate features: "
+            + ", ".join(missing_pool_cols)
+        )
+    X = X[pool_cols]
+
     if X.shape[1] == 0:
         raise ValueError("No numeric training features found after dropping identifier/leakage columns.")
     feature_cols = list(X.columns)
-
-    eval_cols = [c for c in ["source_type", "train_horizon", "is_censored", "too_sparse", "low_resolution"] if c in df.columns]
+    eval_cols = [c for c in ["source_type", "train_horizon", "is_censored", "too_sparse"] if c in df.columns]
     eval_df = df[eval_cols].copy() if eval_cols else pd.DataFrame(index=df.index)
     return X, y, groups, feature_cols, eval_df
 
+def _retire_previous_run_artifacts(art_dir: Path) -> List[str]:
+    patterns = [
+        "*_selected_pipeline_*.joblib",
+        "*_selected_pipeline_*.manifest.json",
+        "selected_features_*.json",
+        "thresholds_*.json",
+        "train_results_selected_*.csv",
+    ]
+    removed = []
+    for pattern in patterns:
+        for f in art_dir.glob(pattern):
+            try:
+                f.unlink()
+                removed.append(str(f))
+            except OSError:
+                pass
+    return removed
 
-def build_models() -> Dict[str, Pipeline]:
+
+def build_models(*, random_state: int = RANDOM_STATE) -> Dict[str, Pipeline]:
     lr = Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="median")),
+            ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
             ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(max_iter=500, class_weight="balanced", random_state=RANDOM_STATE)),
+            ("clf", LogisticRegression(max_iter=500, class_weight="balanced", random_state=random_state)),
         ]
     )
     rf = Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="median")),
+            ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
             ("clf", RandomForestClassifier(
                 n_estimators=600,
-                random_state=RANDOM_STATE,
+                random_state=random_state,
                 class_weight="balanced_subsample",
                 n_jobs=-1,
             )),
@@ -166,11 +153,11 @@ def build_models() -> Dict[str, Pipeline]:
     )
     hgb = Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="median")),
+            ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
             ("clf", HistGradientBoostingClassifier(
                 max_depth=6,
                 learning_rate=0.08,
-                random_state=RANDOM_STATE,
+                random_state=random_state,
             )),
         ]
     )
@@ -205,7 +192,7 @@ def _slice_metrics(df_eval: pd.DataFrame, y_true: pd.Series, y_pred: np.ndarray,
     base.update({"model": model, "split": split, "slice_col": "overall", "slice_val": "all", "n": int(len(y_true))})
     rows.append(base)
 
-    for col in ["source_type", "train_horizon", "is_censored", "too_sparse", "low_resolution"]:
+    for col in ["source_type", "train_horizon", "is_censored", "too_sparse"]:
         if col not in df_eval.columns:
             continue
         vals = df_eval[col]
@@ -227,12 +214,14 @@ def _slice_metrics(df_eval: pd.DataFrame, y_true: pd.Series, y_pred: np.ndarray,
     return rows
 
 
-def _group_split(X: pd.DataFrame, y: pd.Series, groups: pd.Series) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _group_split(
+    X: pd.DataFrame, y: pd.Series, groups: pd.Series, *, random_state: int = RANDOM_STATE
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     idx = np.arange(len(X))
-    gss_outer = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=RANDOM_STATE)
+    gss_outer = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=random_state)
     trainval_idx, test_idx = next(gss_outer.split(idx, y, groups))
 
-    gss_inner = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=RANDOM_STATE + 1)
+    gss_inner = GroupShuffleSplit(n_splits=1, test_size=0.25, random_state=random_state + 1)
     inner_groups = groups.iloc[trainval_idx]
     train_rel, val_rel = next(gss_inner.split(trainval_idx, y.iloc[trainval_idx], inner_groups))
     train_idx = trainval_idx[train_rel]
@@ -286,7 +275,10 @@ def write_requirements_lock(out_path: str):
 
 
 def main():
-    out = train_from_meta_csv(meta_csv=TRAIN_META_CSV, art_dir=ART_DIR)
+    out = train_from_meta_csv(
+        meta_csv=TRAIN_META_CSV, art_dir=ART_DIR, selected_features=STAGE1_SELECTED_FEATURES,
+    )
+
     print("Training complete:", json.dumps(out, indent=2))
 
 
@@ -297,10 +289,16 @@ def train_from_meta_csv(
     run_tag: str | None = None,
     write_lockfile: bool = True,
     selected_features: List[str] | None = None,
+    retire_previous_runs: bool = True,
+    random_state: int = RANDOM_STATE,
 ) -> dict:
     meta_csv = Path(meta_csv)
     art_dir = Path(art_dir)
     art_dir.mkdir(parents=True, exist_ok=True)
+
+    retired_files: List[str] = []
+    if retire_previous_runs:
+        retired_files = _retire_previous_run_artifacts(art_dir)
 
     meta = pd.read_csv(meta_csv)
     label_col = detect_label_col(meta)
@@ -316,17 +314,22 @@ def train_from_meta_csv(
         X = X[selected_features].copy()
         feature_cols = list(selected_features)
 
-    train_idx, val_idx, test_idx = _group_split(X, y, groups)
+    train_idx, val_idx, test_idx = _group_split(X, y, groups, random_state=random_state)
 
     overlap = set(groups.iloc[train_idx]).intersection(set(groups.iloc[test_idx]))
     if overlap:
         raise RuntimeError("Group split leakage detected: base_curve_id appears in both train and test.")
 
-    models = build_models()
+    models = build_models(random_state=random_state)
     results, fitted = fit_and_eval(models, X, y, eval_df, train_idx, val_idx, test_idx)
 
     if run_tag is None:
         run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    val_overall = results[(results["split"] == "val") & (results["slice_col"] == "overall")]
+    val_balanced_acc_by_model = {
+        row["model"]: float(row["balanced_acc"]) for _, row in val_overall.iterrows()
+    }
 
     model_paths = {}
     manifest_paths = {}
@@ -340,6 +343,7 @@ def train_from_meta_csv(
                 extra={
                     "feature_columns": feature_cols,
                     "group_split_col": "base_curve_id" if "base_curve_id" in meta.columns else "Test Id",
+                    "val_balanced_accuracy": val_balanced_acc_by_model.get(name, None),
                 },
             )
         )
@@ -377,8 +381,56 @@ def train_from_meta_csv(
             "val": int(len(val_idx)),
             "test": int(len(test_idx)),
         },
+        "retired_previous_run_files": retired_files,
+
     }
 
+def evaluate_split_stability(
+    *,
+    meta_csv: str | Path = TRAIN_META_CSV,
+    seeds: List[int] = [42, 43, 44, 45, 46],
+    selected_features: List[str] | None = None,
+    tmp_root: str | Path = "/tmp/growthqa_split_stability",
+) -> pd.DataFrame:
+    tmp_root = Path(tmp_root)
+    rows = []
+    for i, seed in enumerate(seeds):
+        art_dir = tmp_root / f"seed_{seed}_{i}"
+        train_from_meta_csv(
+            meta_csv=meta_csv,
+            art_dir=art_dir,
+            run_tag=f"stability_{seed}_{i}",
+            write_lockfile=False,
+            selected_features=selected_features,
+            random_state=seed,
+        )
+        summary = pd.read_csv(art_dir / f"train_results_selected_stability_{seed}_{i}.csv")
+        test_overall = summary[(summary["split"] == "test") & (summary["slice_col"] == "overall")].copy()
+        test_overall["seed"] = seed
+        rows.append(test_overall)
+
+    all_runs = pd.concat(rows, ignore_index=True)
+
+    summary_rows = []
+    for model_name, grp in all_runs.groupby("model"):
+        for metric in ["balanced_acc", "precision", "recall", "f1", "roc_auc"]:
+            if metric not in grp.columns:
+                continue
+            summary_rows.append({
+                "model": model_name,
+                "metric": metric,
+                "mean": float(grp[metric].mean()),
+                "std": float(grp[metric].std(ddof=1)),
+                "min": float(grp[metric].min()),
+                "max": float(grp[metric].max()),
+                "n_seeds": int(len(grp)),
+            })
+    stability_summary = pd.DataFrame(summary_rows)
+
+    import shutil
+    shutil.rmtree(tmp_root, ignore_errors=True)
+
+    return stability_summary
 
 if __name__ == "__main__":
     main()

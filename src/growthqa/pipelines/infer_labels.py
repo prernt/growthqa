@@ -1,19 +1,16 @@
 from __future__ import annotations
-
 import json
 import re
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
-
 import importlib
 import joblib
 import numpy as np
 import pandas as pd
 import platform
 import sklearn
-
 from growthqa.pipelines.build_meta_dataset import (
     run_merge_preprocess_meta,
     TRAIN_STEP_HOURS,
@@ -22,26 +19,38 @@ from growthqa.pipelines.build_meta_dataset import (
     TRAIN_SMOOTH_WINDOW,
     TRAIN_NORMALIZE,
 )
+from growthqa.config import (
+    MIN_POINTS, MAX_GAP_HOURS_OVERRIDE, MISSING_FRAC_OVERRIDE,
+    LATE_WINDOW_REFERENCE_STEP_HOURS, LATE_WINDOW_MAX_MISSING_FRAC,
+    MIN_LATE_POINTS_FLOOR, MIN_LATE_POINTS_CEILING,MISSING_FEATURE_FRAC_OVERRIDE,
+    MIN_LATE_HOURS_ANCHOR, MIN_LATE_POINTS_FALLBACK_RATE_PER_HOUR, STAGE1_SELECTED_FEATURES
+)
 from growthqa.preprocess.timegrid import parse_time_from_header, get_sorted_time_columns
-
-# Stage-2 (evidence-based checker)
 from growthqa.stage2.late_window import (
     Stage2ConfigEvidence,
     EvidenceScores,
     compute_evidence_scores,
     compute_stage2_checker_status,
 )
+from growthqa.io.tidy import (
+    extract_conc_from_curve_id as _extract_conc_from_curve_id,
+    find_concentration_col as _find_concentration_col,
+    wide_to_grofit_tidy as _canonical_wide_to_grofit_tidy,
+)
 
 
-# ============================================================
-# Model loading utilities
-# ============================================================
+def _temp_dir_context():
+    if sys.version_info >= (3, 10):
+        return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    else:
+        return tempfile.TemporaryDirectory()
+
+
 def assert_runtime_matches_model(model_path: str) -> None:
     mp = Path(model_path)
     manifest = mp.with_suffix(".manifest.json")
     if not manifest.exists():
         return
-
     m = json.loads(manifest.read_text(encoding="utf-8"))
     problems = []
     if m.get("python_version") != platform.python_version():
@@ -60,13 +69,19 @@ def assert_runtime_matches_model(model_path: str) -> None:
             file=sys.stderr,
         )
 
+def _read_val_balanced_accuracy(model_path: str) -> float | None:
+    mp = Path(model_path)
+    manifest = mp.with_suffix(".manifest.json")
+    if not manifest.exists():
+        return None
+    try:
+        m = json.loads(manifest.read_text(encoding="utf-8"))
+        v = m.get("val_balanced_accuracy", None)
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
 def _install_legacy_sklearn_pickle_aliases() -> None:
-    """
-    Backward-compatibility shim for old sklearn pickles.
-    Some older HistGradientBoosting models reference a private module path:
-      sklearn.ensemble._hist_gradient_boosting.loss
-    Newer sklearn versions moved losses under sklearn._loss.loss.
-    """
     legacy_mod = "sklearn.ensemble._hist_gradient_boosting.loss"
     if legacy_mod in sys.modules:
         return
@@ -176,38 +191,6 @@ def _safe_get_setting(settings: Any, key: str, default: Any) -> Any:
     return getattr(settings, key, default)
 
 
-# ============================================================
-# Curve key helpers
-# ============================================================
-def _extract_conc_from_curve_id(curve_id: str) -> float | None:
-    if curve_id is None:
-        return None
-    s = str(curve_id)
-    m = re.search(
-        r"\[(?:\s*Conc\s*=\s*)?([0-9]+(?:\.[0-9]+)?)\s*\]",
-        s,
-        flags=re.IGNORECASE,
-    )
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except Exception:
-        return None
-
-
-def _find_concentration_col(df: pd.DataFrame) -> str | None:
-    candidates = ["concentration", "Concentration", "conc", "Conc", "dose", "Dose", "drug_conc", "DrugConc"]
-    for c in candidates:
-        if c in df.columns:
-            return c
-    lower_map = {str(c).lower(): c for c in df.columns}
-    for c in candidates:
-        if c.lower() in lower_map:
-            return lower_map[c.lower()]
-    return None
-
-
 def _fmt_conc_for_key(v: object) -> str:
     n = pd.to_numeric(pd.Series([v]), errors="coerce").iloc[0]
     if not np.isfinite(n):
@@ -248,9 +231,6 @@ def _attach_curve_key(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# ============================================================
-# Wide -> tidy grofit
-# ============================================================
 def wide_original_to_grofit_tidy(
     wide_original: pd.DataFrame,
     *,
@@ -259,34 +239,7 @@ def wide_original_to_grofit_tidy(
 ) -> pd.DataFrame:
     if test_id_col not in wide_original.columns:
         raise ValueError(f"Expected '{test_id_col}' in canonical wide input.")
-
-    time_cols = [c for c in wide_original.columns if parse_time_from_header(str(c)) is not None]
-    if not time_cols:
-        raise ValueError("No time columns detected in wide_original (expected T#.## (h) headers).")
-
-    conc_col = _find_concentration_col(wide_original)
-    id_vars = [test_id_col] + ([conc_col] if conc_col is not None else [])
-    tidy = wide_original.melt(id_vars=id_vars, value_vars=time_cols, var_name="_time_label", value_name="y")
-    tidy["time"] = tidy["_time_label"].map(lambda s: float(parse_time_from_header(str(s))))
-    tidy.drop(columns=["_time_label"], inplace=True)
-    tidy["test_id"] = str(file_tag)
-    tidy["curve_id"] = tidy[test_id_col].astype(str)
-    if conc_col is None:
-        tidy["concentration"] = tidy[test_id_col].astype(str).map(_extract_conc_from_curve_id)
-        tidy["concentration"] = pd.to_numeric(tidy["concentration"], errors="coerce").fillna(0.0)
-    else:
-        tidy["concentration"] = pd.to_numeric(tidy[conc_col], errors="coerce").fillna(0.0)
-    tidy["y"] = pd.to_numeric(tidy["y"], errors="coerce")
-    tidy = tidy.dropna(subset=["time", "y"])
-    return tidy[["test_id", "curve_id", "concentration", "time", "y"]]
-
-
-# ============================================================
-# Stage-2 evidence feature computation from wide
-# ============================================================
-# def _get_time_cols(wide_df: pd.DataFrame) -> list[str]:
-#     cols = [c for c in wide_df.columns if parse_time_from_header(str(c)) is not None]
-#     return sorted(cols, key=lambda c: float(parse_time_from_header(str(c))))
+    return _canonical_wide_to_grofit_tidy(wide_original, file_tag=file_tag, test_id_col=test_id_col)
 
 
 def _compute_stage2_features_from_wide_evidence(
@@ -294,11 +247,6 @@ def _compute_stage2_features_from_wide_evidence(
     *,
     cfg: Stage2ConfigEvidence,
 ) -> pd.DataFrame:
-    """
-    Computes Stage-2 evidence scores PER CURVE using full-horizon raw wide table.
-
-    Returns scalar-only columns (CSV/UI friendly).
-    """
     time_cols = get_sorted_time_columns(wide_raw_df)
     rows: list[dict[str, object]] = []
 
@@ -309,7 +257,7 @@ def _compute_stage2_features_from_wide_evidence(
 
         ev = compute_evidence_scores(row_raw, time_cols, cfg)
 
-        has_late = bool(ev.n_late_points >= cfg.min_late_points)
+        has_late = bool(ev.late_coverage_ok)
 
         rows.append(
             {
@@ -317,20 +265,17 @@ def _compute_stage2_features_from_wide_evidence(
                 "Concentration": conc,
                 "curve_key": curve_key,
                 "has_late_data": has_late,
-                "late_window_start": float(cfg.stage2_start),
                 "late_n_points": int(ev.n_late_points),
+                "min_late_points_required": int(ev.min_late_points_required),
                 "late_span_hours": float(ev.late_span_hours) if np.isfinite(ev.late_span_hours) else np.nan,
-                # Core evidence
                 "growth_z_like": float(ev.growth_z_like),
                 "artifact_score": float(ev.artifact_score),
                 "decline_score": float(ev.decline_score),
                 "data_quality": float(ev.data_quality),
                 "decision_confidence": float(ev.confidence),
-                # Supporting
                 "late_slope": float(ev.late_slope) if np.isfinite(ev.late_slope) else np.nan,
                 "late_delta": float(ev.late_delta) if np.isfinite(ev.late_delta) else np.nan,
                 "noise_level": float(ev.noise_level) if np.isfinite(ev.noise_level) else np.nan,
-                # Flags (thresholded)
                 "late_growth_detected": bool(ev.growth_z_like >= cfg.growth_z_threshold),
                 "artifact_detected": bool(ev.artifact_score >= cfg.artifact_score_threshold),
             }
@@ -345,20 +290,6 @@ def _assign_stage2_checker_outputs(
     cfg: Stage2ConfigEvidence,
     unsure_conf_threshold: float | None = None,
 ) -> pd.DataFrame:
-    """
-    Uses the evidence columns already merged into out_df to compute:
-
-      - Stage 2 Label            (checker status: Corroborated / Contradiction / Insufficient)
-      - Label Reason
-      - Pred Label                (Stage-1's own call, downgraded to Unsure only by
-                                    the Stage-1 confidence gate; never touched by Stage-2)
-      - Final Label (S1+S2)       (the combined decision actually used downstream)
-
-    unsure_conf_threshold, when given, adds a Stage-1 confidence gate that runs
-    independently of the Stage-2 checker. It applies whenever the predicted
-    probability sits within unsure_conf_threshold of 0.5, regardless of whether
-    late-window data exists or what Stage-2 found.
-    """
     stage2_labels: list[str] = []
     pred_labels: list[str] = []
     reasons: list[str] = []
@@ -368,6 +299,7 @@ def _assign_stage2_checker_outputs(
         s1 = _normalize_label_text(row.get("pred_label", ""))
         s1_conf = pd.to_numeric(pd.Series([row.get("pred_confidence", np.nan)]), errors="coerce").iloc[0]
         s1_conf_valid = pd.to_numeric(pd.Series([row.get("confidence_valid", np.nan)]), errors="coerce").iloc[0]
+        _late_n_raw = pd.to_numeric(pd.Series([row.get("late_n_points", 0)]), errors="coerce").iloc[0]
 
         ev = EvidenceScores(
             growth_z_like=float(pd.to_numeric(pd.Series([row.get("growth_z_like", 0.0)]), errors="coerce").iloc[0]),
@@ -378,7 +310,7 @@ def _assign_stage2_checker_outputs(
             late_slope=float(pd.to_numeric(pd.Series([row.get("late_slope", np.nan)]), errors="coerce").iloc[0]),
             late_delta=float(pd.to_numeric(pd.Series([row.get("late_delta", np.nan)]), errors="coerce").iloc[0]),
             noise_level=float(pd.to_numeric(pd.Series([row.get("noise_level", np.nan)]), errors="coerce").iloc[0]),
-            n_late_points=int(pd.to_numeric(pd.Series([row.get("late_n_points", 0)]), errors="coerce").iloc[0]),
+            n_late_points=int(_late_n_raw) if pd.notna(_late_n_raw) else 0,
             late_span_hours=float(pd.to_numeric(pd.Series([row.get("late_span_hours", np.nan)]), errors="coerce").iloc[0]),
         )
 
@@ -388,13 +320,11 @@ def _assign_stage2_checker_outputs(
             evidence=ev,
             cfg=cfg,
         )
-
         stage2_labels.append(status)
-
         low_confidence = False
         if unsure_conf_threshold is not None and np.isfinite(s1_conf_valid):
             margin = min(float(s1_conf_valid), 1.0 - float(s1_conf_valid))
-            low_confidence = margin > float(unsure_conf_threshold)
+            low_confidence = margin > float(unsure_conf_threshold) + 1e-9
 
         if low_confidence:
             label_for_reason = s1 if s1 else "Unknown"
@@ -421,14 +351,10 @@ def _assign_stage2_checker_outputs(
     out["Label Reason"] = reasons
     out["Pred Label"] = pred_labels
     out["Final Label (S1+S2)"] = final_labels
-    out["final_label"] = final_labels  # alias used by downstream consumers, e.g. init_review_df
-
+    out["final_label"] = final_labels 
     return out
 
 
-# ============================================================
-# Main inference function
-# ============================================================
 def run_label_inference_from_uploaded_wide(
     wide_df: pd.DataFrame,
     settings: Any,
@@ -440,49 +366,47 @@ def run_label_inference_from_uploaded_wide(
     if "Test Id" not in wide_df.columns:
         raise ValueError("Uploaded canonical wide data must include 'Test Id'.")
 
-    # full horizon (for Stage-2 evidence)
+    dup_ids = wide_df["Test Id"][wide_df["Test Id"].duplicated(keep=False)]
+    if not dup_ids.empty:
+        examples = sorted(set(dup_ids.astype(str)))[:5]
+        raise ValueError(
+            "Uploaded data contains duplicate 'Test Id' values, which is not "
+            "supported -- each curve in a single upload must have a unique "
+            "Test Id (rename the repeated wells/curves, e.g. 'A01' and "
+            "'A01_2', before re-uploading). Duplicated value(s): "
+            + ", ".join(examples)
+            + (" ..." if len(set(dup_ids.astype(str))) > 5 else "")
+        )
     wide_raw_df = _attach_curve_key(wide_df.copy())
-
-    # ---- Stage-1 pre-processing runs on the early (0..stage2_start) window ----
-    # The early window is written to a temp CSV and passed through the same
-    # merge/preprocess/meta path used for training. Stage-2 ignores truncation
-    # and reads the full horizon directly from wide_raw_df.
     time_cols_all = [c for c in wide_raw_df.columns if parse_time_from_header(str(c)) is not None]
     non_time_cols = [c for c in wide_raw_df.columns if c not in time_cols_all]
     early_cols = [c for c in time_cols_all if float(parse_time_from_header(str(c))) <= float(stage2_start)]
     wide_early_raw_df = wide_raw_df[non_time_cols + early_cols].copy()
 
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+    with _temp_dir_context() as td:
         tmp_wide_csv = Path(td) / "wide_input.csv"
         wide_early_raw_df.drop(columns=["curve_key"], errors="ignore").to_csv(tmp_wide_csv, index=False)
-
-        blank_default = "RAW" if bool(_safe_get_setting(settings, "input_is_raw", False)) else "ALREADY"
         raw_merged_df, final_merged_df, meta_df = run_merge_preprocess_meta(
             inputs=[str(tmp_wide_csv)],
             out_raw=None,
             out_final=None,
             out_meta=None,
-            # Pinned to the training configuration (TRAIN_* in build_meta_dataset)
-            # so an uploaded curve is preprocessed identically to the training set.
             step=TRAIN_STEP_HOURS,
-            min_points=3,
-            low_res_threshold=7,
+            min_points=MIN_POINTS,
             tmax_hours=TRAIN_TMAX_HOURS,
-            blank_subtracted=True,
+            blank_subtracted=False,
             clip_negatives=False,
-            global_blank=_safe_get_setting(settings, "global_blank", None),
-            # blank_status_csv=None,
-            blank_default=blank_default,
+            global_blank=None,
+            blank_default="ALREADY",
             smooth_method=TRAIN_SMOOTH_METHOD,
             smooth_window=TRAIN_SMOOTH_WINDOW,
             normalize=TRAIN_NORMALIZE,
             loglevel="ERROR",
             augment_trunc=False,
+
         )
 
     meta_df = _attach_curve_key(meta_df)
-
-    # ---- Stage-1 model inference ----
     available_models = discover_models(model_dir)
     model_label_map: dict[str, Path] = {}
     for stem, p in available_models.items():
@@ -494,11 +418,42 @@ def run_label_inference_from_uploaded_wide(
         raise FileNotFoundError(f"No trained model found in {model_dir}.")
 
     if model_name == "Average":
-        pipelines = {label: load_model_pipeline(str(path)) for label, path in model_label_map.items()}
+        pipelines = {}
+        for label, path in model_label_map.items():
+            try:
+                pipelines[label] = load_model_pipeline(str(path))
+            except Exception as e:
+                print(
+                    f"Skipping model '{label}' at {path}: failed to load "
+                    f"({type(e).__name__}: {e}). Continuing with remaining "
+                    f"ensemble members.",
+                    file=sys.stderr,
+                )
+        if not pipelines:
+            raise RuntimeError(
+                f"No model in {model_dir} could be loaded in this environment. "
+                "Retrain the classifier here (Train / Refresh Classifier) to "
+                "regenerate models compatible with the installed library versions."
+            )
         per_model_preds = []
         for lbl, pipe in pipelines.items():
-            plabel, pconf, pvalid = predict_hard_with_confidence(pipe, meta_df)
+            try:
+                plabel, pconf, pvalid = predict_hard_with_confidence(pipe, meta_df)
+            except Exception as e:
+                print(
+                    f"Skipping model '{lbl}': loaded but failed to predict "
+                    f"({type(e).__name__}: {e}). Continuing with remaining "
+                    f"ensemble members.",
+                    file=sys.stderr,
+                )
+                continue
             per_model_preds.append((lbl, plabel, pconf, pvalid))
+        if not per_model_preds:
+            raise RuntimeError(
+                f"No model in {model_dir} could produce predictions in this "
+                "environment. Retrain the classifier here (Train / Refresh "
+                "Classifier) to regenerate compatible models."
+            )
         valid_probs_list = []
         for _, plabel, _, pvalid in per_model_preds:
             if np.any(np.isfinite(pvalid)):
@@ -506,19 +461,12 @@ def run_label_inference_from_uploaded_wide(
             else:
                 valid_probs_list.append(_labels_to_prob_valid(plabel))
         valid_probs = np.vstack(valid_probs_list)
-
-        # Ensemble weighting (known limitation, kept intentionally):
-        # Each member is weighted by its mean certainty |p - 0.5| measured
-        # over the curves in THIS request, so the weights depend on the batch
-        # uploaded together. An identical curve can therefore receive a
-        # slightly different ensemble probability depending on its companions.
-        # This is documented rather than changed, to keep inference behaviour
-        # stable across the reported experiments.
-        eps = 1e-9
-        p_clipped = np.clip(valid_probs, eps, 1 - eps)
-        model_certainty = np.nanmean(np.abs(p_clipped - 0.5), axis=1)
-        if model_certainty.sum() > 0:
-            model_weights = model_certainty / model_certainty.sum()
+        val_scores = np.array(
+            [_read_val_balanced_accuracy(str(model_label_map[lbl])) for lbl, _, _, _ in per_model_preds],
+            dtype=float,
+        )
+        if np.all(np.isfinite(val_scores)) and np.nansum(val_scores) > 0:
+            model_weights = val_scores / np.nansum(val_scores)
         else:
             model_weights = np.ones(len(valid_probs_list)) / len(valid_probs_list)
 
@@ -553,13 +501,16 @@ def run_label_inference_from_uploaded_wide(
     out_df["confidence_valid"] = np.round(final_prob, 4)
     out_df["confidence_invalid"] = np.round(1 - final_prob, 4)
     out_df["is_valid_pred"] = out_df["pred_label"].map(_label_is_valid).astype(bool)
-
-    # out_df["Predicted S1 Label"] = out_df["pred_label"].astype(str)
     out_df["S1 Confidence Valid"] = out_df["confidence_valid"]
-
-    # ---- Stage-2 evidence computation ----
-    stage2_cfg = Stage2ConfigEvidence(stage2_start=float(stage2_start))
-
+    stage2_cfg = Stage2ConfigEvidence(
+        stage2_start=float(stage2_start),
+        late_window_reference_step_hours=float(LATE_WINDOW_REFERENCE_STEP_HOURS),
+        late_window_max_missing_frac=float(LATE_WINDOW_MAX_MISSING_FRAC),
+        min_late_points_floor=int(MIN_LATE_POINTS_FLOOR),
+        min_late_points_ceiling=int(MIN_LATE_POINTS_CEILING),
+        min_late_hours_anchor=float(MIN_LATE_HOURS_ANCHOR),
+        min_late_points_fallback_rate_per_hour=float(MIN_LATE_POINTS_FALLBACK_RATE_PER_HOUR),
+    )
     stage2_df = _compute_stage2_features_from_wide_evidence(wide_raw_df, cfg=stage2_cfg)
 
     out_df = out_df.merge(
@@ -567,19 +518,39 @@ def run_label_inference_from_uploaded_wide(
         on=["curve_key"],
         how="left",
     )
-
-    # Checker outputs + conservative final label
     out_df = _assign_stage2_checker_outputs(out_df, cfg=stage2_cfg, unsure_conf_threshold=unsure_conf_threshold)
-
-    # Authoritative sparse override: sparse curves can never remain Valid.
+    ood_gap_mask = (
+        pd.to_numeric(out_df.get("max_gap_hours", np.nan), errors="coerce") > MAX_GAP_HOURS_OVERRIDE
+    ) | (
+        pd.to_numeric(out_df.get("missing_frac_on_grid", np.nan), errors="coerce") > MISSING_FRAC_OVERRIDE
+    )
+    ood_gap_mask = ood_gap_mask.fillna(False)
+    if ood_gap_mask.any():
+        out_df.loc[ood_gap_mask, "final_label"] = "Unsure"
+        out_df.loc[ood_gap_mask, "Final Label (S1+S2)"] = "Unsure"
+        out_df.loc[ood_gap_mask, "Pred Label"] = "Unsure"
+        out_df.loc[ood_gap_mask, "pred_label"] = "Unsure"
+        out_df.loc[ood_gap_mask, "Label Reason"] = "OUT_OF_DISTRIBUTION_GAP_OVERRIDE"
+    _feat_cols = [c for c in STAGE1_SELECTED_FEATURES if c in out_df.columns]
+    n_missing = out_df[_feat_cols].isna().sum(axis=1)
+    missing_frac = n_missing / max(len(_feat_cols), 1)
+    out_df["n_features_missing"] = n_missing
+    out_df["feature_missing_frac"] = missing_frac.round(3)
+    feature_completeness_mask = (missing_frac > MISSING_FEATURE_FRAC_OVERRIDE).fillna(False)
+    if feature_completeness_mask.any():
+        out_df.loc[feature_completeness_mask, "final_label"] = "Unsure"
+        out_df.loc[feature_completeness_mask, "Final Label (S1+S2)"] = "Unsure"
+        out_df.loc[feature_completeness_mask, "Pred Label"] = "Unsure"
+        out_df.loc[feature_completeness_mask, "pred_label"] = "Unsure"
+        out_df.loc[feature_completeness_mask, "Label Reason"] = "FEATURE_COMPLETENESS_OVERRIDE"
     too_sparse_mask = pd.to_numeric(out_df.get("too_sparse", False), errors="coerce").fillna(0).astype(int).eq(1)
     if too_sparse_mask.any():
         out_df.loc[too_sparse_mask, "final_label"] = "Unsure"
+        out_df.loc[too_sparse_mask, "Final Label (S1+S2)"] = "Unsure"
         out_df.loc[too_sparse_mask, "Pred Label"] = "Unsure"
         out_df.loc[too_sparse_mask, "pred_label"] = "Unsure"
         out_df.loc[too_sparse_mask, "Label Reason"] = "TOO_SPARSE_OVERRIDE"
 
-    # UI/manual review init
     out_df["Reviewed"] = False
     out_df["is_valid_final"] = out_df["final_label"].map(_label_is_valid).astype(bool)
 

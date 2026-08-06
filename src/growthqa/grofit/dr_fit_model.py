@@ -1,11 +1,8 @@
 from __future__ import annotations
-
 from typing import Any, Dict
-
 import numpy as np
 from scipy.optimize import curve_fit
-
-from .parametric_models import aic_from_rss
+from growthqa.grofit.parametric_models import aic_from_rss
 
 
 def _hill_4pl(x: np.ndarray, bottom: float, top: float, ec50: float, hill: float) -> np.ndarray:
@@ -62,6 +59,7 @@ def dr_fit_model(conc: np.ndarray, resp: np.ndarray) -> Dict[str, Any]:
 
         return {
             "success": True,
+            "method": "4pl",
             "message": "ok",
             "n": int(len(x)),
             "model": "4pl",
@@ -70,6 +68,7 @@ def dr_fit_model(conc: np.ndarray, resp: np.ndarray) -> Dict[str, Any]:
             "ec50": float(params[2]),
             "hill": float(params[3]),
             "y_ec50": float(_hill_4pl(np.array([float(params[2])]), *params)[0]),
+            "y_ec50_orig": float(_hill_4pl(np.array([float(params[2])]), *params)[0]),
             "r2": r2,
             "aic": aic,
             "rss": rss,
@@ -88,6 +87,7 @@ def dr_fit_model(conc: np.ndarray, resp: np.ndarray) -> Dict[str, Any]:
             "converged": False,
             "ec50": np.nan,
             "y_ec50": np.nan,
+            "y_ec50_orig": np.nan,
             "aic": np.nan,
             "r2": np.nan,
             "rss": np.nan,

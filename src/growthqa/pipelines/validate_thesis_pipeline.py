@@ -1,19 +1,12 @@
 from __future__ import annotations
-
 import argparse
 import tempfile
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
-
 from growthqa.classifier.train_from_meta import _group_split, build_model_matrix, detect_label_col
 from growthqa.pipelines.build_meta_dataset import run_merge_preprocess_meta
 from growthqa.preprocess.timegrid import parse_time_from_header, get_time_columns
-
-
-# def _time_cols(df: pd.DataFrame) -> list[str]:
-#     return [c for c in df.columns if parse_time_from_header(str(c)) is not None]
 
 
 def run_validation(inputs: list[str]) -> None:
@@ -48,15 +41,11 @@ def run_validation(inputs: list[str]) -> None:
             "is_censored",
             "n_points_observed",
             "max_gap_hours",
-            "median_dt_hours",
             "missing_frac_on_grid",
-            "low_resolution",
             "too_sparse",
+            "grid_resolution_mismatch",
             "initial_OD",
             "final_OD",
-            "max_OD",
-            "min_OD",
-            "range_OD",
             "auc",
             "auc_per_hour",
             "net_change_per_hour",

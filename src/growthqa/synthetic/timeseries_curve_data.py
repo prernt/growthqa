@@ -1,81 +1,27 @@
-#!/usr/bin/env python3
-"""
-timeseries_curve_data.py
-------------------------
-Synthetic growth-curve generator for GrowthQA.
-
-The generator writes one wide CSV:
-
-    timeseries_wide_<file-stem>.csv
-        Columns:
-            FileName, Test Id, Model Name, Is_Valid, Curve Subtype,
-            T0.0 (h), T0.5 (h), ...
-
-It also appends a dated record of every run to run_info.xlsx.
-
-Design
-------
-The dataset has a fixed composition (see VALID_COMPOSITION / INVALID_COMPOSITION).
-All curves are generated on a single time grid (default 0-16 h, 0.5 h step),
-matching the 16 h training window used throughout GrowthQA.
-
-Curve families
---------------
-Valid curves use established single-phase growth-model forms:
-    Logistic, Gompertz, ModifiedGompertz, Richards  (Zwietering et al. 1990; Kahm et al. 2010)
-    decline = growth phase followed by a death phase (Monod 1949, four-phase structure)
-
-Invalid curves cover both curves that single-phase fitting cannot represent and
-recognised assay-failure modes:
-    diauxic      - two sequential growth phases (Monod 1949); biologically real but
-                   not representable by a single-phase model, so invalid for fitting
-    obvious      - abrupt mid-curve crash or tail collapse (contamination / lysis)
-    subtle       - localised reading artifact (bubble / condensation / misread)
-    nearreal     - suppressed, non-stabilising plateau (insufficient stationary phase)
-    decline_only - decay with no preceding growth (dead inoculum / wrong well)
-    noise        - low signal-to-noise readings (no usable growth signal)
-    nogrowth     - flat near-zero curve (negative control)
-
-The four corruption families (obvious, subtle, nearreal, and the imperfections
-injected into valid curves) are engineering constructions that mimic documented
-plate-reader and culture failures.
-"""
-
 from __future__ import annotations
-
 import argparse
 import logging
 import os
 from datetime import datetime
-
 import numpy as np
 import pandas as pd
+from growthqa.grofit.parametric_models import (
+    logistic as _grofit_logistic,
+    gompertz as _grofit_gompertz,
+    richards as _grofit_richards,
+)
+from openpyxl import Workbook, load_workbook
 
-
-# ---------------------------------------------------------------------------
-# 1) Growth-model definitions
-# ---------------------------------------------------------------------------
-# Logistic and Gompertz use the A, mu, lambda parameterisation.
-# A = carrying capacity, mu = max growth rate, lambda = lag time.
 
 def logistic(t, A, mu, lam):
-    return A / (1.0 + np.exp((4.0 * mu / A) * (lam - t) + 2.0))
-
+    return _grofit_logistic(t, 0.0, A, mu, lam)
+ 
 
 def gompertz(t, A, mu, lam):
-    return A * np.exp(-np.exp((mu * np.e / A) * (lam - t) + 1.0))
+    return _grofit_gompertz(t, 0.0, A, mu, lam) 
 
 
-def modified_gompertz(t, A, mu, lam, alpha, tshift):
-    """Zwietering Gompertz with a bounded, saturating late adjustment.
-
-    The primary term is the standard A, mu, lambda Gompertz (Zwietering et al. 1990),
-    bounded by A. The secondary term adds a late adjustment of small amplitude
-    ``alpha * A`` that switches on at ``tshift`` and saturates, modelling a mild
-    drift of the stationary level without introducing a second growth phase. The
-    curve is monotone non-decreasing, stays bounded by ``A * (1 + alpha)``, and
-    reaches a finite plateau, so it remains a valid single-phase curve.
-    """
+def bounded_modified_gompertz(t, A, mu, lam, alpha, tshift):
     primary = A * np.exp(-np.exp((mu * np.e / A) * (lam - t) + 1.0))
     onset = np.clip(t - tshift, 0.0, None)
     secondary = alpha * A * (1.0 - np.exp(-onset))
@@ -83,7 +29,7 @@ def modified_gompertz(t, A, mu, lam, alpha, tshift):
 
 
 def richards(t, A, mu, lam, nu):
-    return A * (1.0 + nu * np.exp((mu * (1.0 + nu) / A) * (lam - t))) ** (-1.0 / nu)
+    return _grofit_richards(t, 0.0, A, mu, lam, nu)
 
 
 def diauxic(t, A1, mu1, lam1, A2, mu2, lam2):
@@ -94,27 +40,16 @@ def flat_line(t, baseline):
     return np.full_like(t, baseline)
 
 
-# model name -> (function, parameter names)
 MODEL_SPECS = {
     "Logistic": (logistic, ["A", "mu", "lam"]),
     "Gompertz": (gompertz, ["A", "mu", "lam"]),
-    "ModifiedGompertz": (modified_gompertz, ["A", "mu", "lam", "alpha", "tshift"]),
+    "ModifiedGompertz": (bounded_modified_gompertz, ["A", "mu", "lam", "alpha", "tshift"]),
     "Richards": (richards, ["A", "mu", "lam", "nu"]),
     "Diauxic": (diauxic, ["A1", "mu1", "lam1", "A2", "mu2", "lam2"]),
     "Flat": (flat_line, ["baseline"]),
 }
 
-# Sigmoidal models used for valid (and base-of-invalid) curves.
 GROWTH_MODELS = {"Logistic", "Gompertz", "ModifiedGompertz", "Richards"}
-
-
-# ---------------------------------------------------------------------------
-# 2) Fixed dataset composition
-# ---------------------------------------------------------------------------
-# Explicit per-subtype counts are used instead of tunable weights so the
-# dataset is reproducible and the exact composition can be reported.
-# Lab data contributes only valid curves, so every invalid example here is
-# the synthetic dataset's responsibility.
 
 VALID_COMPOSITION = {
     "plain": 203,
@@ -136,25 +71,16 @@ INVALID_COMPOSITION = {
 N_VALID = sum(VALID_COMPOSITION.values())
 N_INVALID = sum(INVALID_COMPOSITION.values())
 TARGET_CURVES = N_VALID + N_INVALID  # 900
-
-# Imperfections injected into a subset of valid curves so the dataset contains
-# clean valids, imperfect valids, and clearly invalid curves.
-PCT_HIGH_QUALITY_VALID = 0.30   # fraction of valid curves generated with reduced noise
-PCT_MISSING_CURVES = 0.10       # fraction of valid curves given some missing readings
+PCT_HIGH_QUALITY_VALID = 0.30   
+PCT_MISSING_CURVES = 0.10       
 MISSING_FRAC_PER_CURVE = 0.10
-PCT_OUTLIER_CURVES = 0.05       # fraction of valid curves given negative blips
+PCT_OUTLIER_CURVES = 0.05      
 OUTLIER_FRAC_PER_CURVE = 0.05
 OUTLIER_SCALE_MIN = 0.10
 OUTLIER_SCALE_MAX = 0.30
-
-# Decline (death-phase) parameters for the valid "decline" subtype.
 VALID_DECLINE_K_MIN = 0.03
 VALID_DECLINE_K_MAX = 0.15
 
-
-# ---------------------------------------------------------------------------
-# 3) Corruption / imperfection helpers
-# ---------------------------------------------------------------------------
 
 def inject_missing(y: pd.Series, frac: float, rng: np.random.Generator) -> pd.Series:
     if frac <= 0:
@@ -180,7 +106,6 @@ def inject_negative_outliers(
 
 
 def make_obvious_invalid(y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Abrupt mid-curve crash: drop to near-zero somewhere in the middle third."""
     y = np.asarray(y, dtype=float).copy()
     n = len(y)
     if n < 4:
@@ -192,7 +117,6 @@ def make_obvious_invalid(y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
 
 
 def make_sudden_collapse(y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Abrupt tail collapse: sharp drop late in the curve."""
     y = np.asarray(y, dtype=float).copy()
     n = len(y)
     if n < 4:
@@ -203,7 +127,6 @@ def make_sudden_collapse(y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
 
 
 def make_subtle_invalid(y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Localised dip (bubble / misreading) that does not look obviously wrong."""
     y = np.asarray(y, dtype=float).copy()
     n = len(y)
     if n < 6:
@@ -217,7 +140,6 @@ def make_subtle_invalid(y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
 
 
 def make_near_real_invalid(y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Realistic-looking but invalid: suppressed tail that never stabilises."""
     y = np.asarray(y, dtype=float).copy()
     n = len(y)
     if n < 6:
@@ -231,7 +153,6 @@ def make_near_real_invalid(y: np.ndarray, rng: np.random.Generator) -> np.ndarra
 
 
 def make_decline_only_invalid(t: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Starts high and decays with no preceding growth phase."""
     t = np.asarray(t, dtype=float)
     baseline = rng.uniform(0.4, 1.2)
     k = rng.uniform(0.05, 0.2)
@@ -239,7 +160,6 @@ def make_decline_only_invalid(t: np.ndarray, rng: np.random.Generator) -> np.nda
 
 
 def make_noise_dominated(t: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Low signal-to-noise readings with no usable growth signal."""
     t = np.asarray(t, dtype=float)
     baseline = rng.uniform(0.05, 0.2)
     y = baseline + rng.normal(0, 0.2, size=len(t))
@@ -249,7 +169,6 @@ def make_noise_dominated(t: np.ndarray, rng: np.random.Generator) -> np.ndarray:
 def apply_valid_decline(
     y: np.ndarray, t: np.ndarray, rng: np.random.Generator, t_start: float, k: float
 ) -> np.ndarray:
-    """Structured death phase: exponential decay applied after a clear growth phase."""
     y = np.asarray(y, dtype=float).copy()
     decay = np.ones_like(t, dtype=float)
     mask = t > t_start
@@ -257,14 +176,9 @@ def apply_valid_decline(
     return np.clip(y * decay, 0.0, None)
 
 
-# ---------------------------------------------------------------------------
-# 4) Curve sampling
-# ---------------------------------------------------------------------------
-
 def sample_valid_curve(
     subtype: str, time_points: np.ndarray, max_time: float, rng: np.random.Generator
 ) -> tuple[str, np.ndarray]:
-    """Sample one valid single-phase growth curve for the given subtype."""
     model_name = rng.choice(sorted(GROWTH_MODELS))
 
     late_lam_range = (8.0, 12.0) if max_time <= 16.0 else (10.0, min(16.0, max_time))
@@ -286,10 +200,6 @@ def sample_valid_curve(
 def sample_diauxic_curve(
     time_points: np.ndarray, max_time: float, rng: np.random.Generator
 ) -> np.ndarray:
-    """Diauxic growth is biologically genuine (Monod 1949) but contains two sequential
-    growth phases. A single-phase parametric model, which is the GrowthQA / grofit
-    fitting target, cannot represent it, so GrowthQA labels diauxic curves invalid.
-    """
     pars = {
         "A1": rng.uniform(0.3, 1.0),
         "mu1": rng.uniform(0.2, 1.2),
@@ -304,14 +214,12 @@ def sample_diauxic_curve(
 def sample_invalid_curve(
     subtype: str, time_points: np.ndarray, max_time: float, rng: np.random.Generator
 ) -> tuple[str, np.ndarray]:
-    """Sample one invalid curve for the given subtype. Returns (model_name, y)."""
     if subtype == "diauxic":
         return "Diauxic", sample_diauxic_curve(time_points, max_time, rng)
 
     if subtype in {"obvious", "subtle", "nearreal"}:
         base_model, base_curve = sample_valid_curve("plain", time_points, max_time, rng)
         if subtype == "obvious":
-            # Merged failure family: mid-curve crash or tail collapse.
             y = make_obvious_invalid(base_curve, rng) if rng.random() < 0.5 \
                 else make_sudden_collapse(base_curve, rng)
         elif subtype == "subtle":
@@ -329,10 +237,6 @@ def sample_invalid_curve(
     raise ValueError(f"Unknown invalid subtype: {subtype}")
 
 
-# ---------------------------------------------------------------------------
-# 5) Dataset generation
-# ---------------------------------------------------------------------------
-
 def generate_synthetic_wide_df(
     *,
     tmax_hours: float = 16.0,
@@ -342,11 +246,6 @@ def generate_synthetic_wide_df(
     file_stem: str = "syn",
     time_unit: str = "h",
 ) -> tuple[pd.DataFrame, dict]:
-    """Generate the synthetic dataset as a single wide DataFrame.
-
-    The composition is fixed by VALID_COMPOSITION / INVALID_COMPOSITION.
-    Returns the DataFrame and a summary dict (counts per subtype).
-    """
     rng = np.random.default_rng(seed)
     time_points = np.arange(0.0, tmax_hours + step_hours / 2.0, step_hours)
 
@@ -373,12 +272,10 @@ def generate_synthetic_wide_df(
         else:
             model_name, y = sample_invalid_curve(subtype, time_points, tmax_hours, rng)
 
-        # Measurement noise. A fraction of valid curves are made cleaner.
         high_quality = is_valid and rng.random() < PCT_HIGH_QUALITY_VALID
         noise_std = noise_level * 0.3 if high_quality else noise_level
         y = y + rng.normal(0.0, noise_std, size=y.shape)
 
-        # Imperfections only on valid curves (invalids are already corrupted).
         if is_valid:
             if rng.random() < PCT_MISSING_CURVES:
                 y = inject_missing(pd.Series(y), MISSING_FRAC_PER_CURVE, rng).values
@@ -388,8 +285,6 @@ def generate_synthetic_wide_df(
                     OUTLIER_SCALE_MIN, OUTLIER_SCALE_MAX, rng,
                 ).values
 
-        # OD600 is physically non-negative; clip after noise and injection.
-        # Missing values (NaN) are preserved by np.clip.
         y = np.clip(y, 0.0, None)
 
         row = {
@@ -421,14 +316,7 @@ def generate_synthetic_wide_df(
     return df, summary
 
 
-# ---------------------------------------------------------------------------
-# 6) Dated run log
-# ---------------------------------------------------------------------------
-
 def write_run_info_xlsx(output_dir: str, wide_path: str, summary: dict) -> str:
-    """Append one dated row per run to run_info.xlsx and refresh the latest snapshot."""
-    from openpyxl import Workbook, load_workbook
-
     xlsx_path = os.path.join(output_dir, "run_info.xlsx")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -478,10 +366,6 @@ def write_run_info_xlsx(output_dir: str, wide_path: str, summary: dict) -> str:
     wb.save(xlsx_path)
     return xlsx_path
 
-
-# ---------------------------------------------------------------------------
-# 7) CLI
-# ---------------------------------------------------------------------------
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="GrowthQA synthetic growth-curve generator (wide CSV).")

@@ -1,4 +1,3 @@
-# src/growthqa/grofit/export.py
 from __future__ import annotations
 import io
 import json
@@ -13,13 +12,12 @@ def export_results_zip(
     dr_fit: pd.DataFrame,
     gc_boot: Optional[pd.DataFrame],
     dr_boot: Optional[pd.DataFrame],
-    dr_audit: Optional[pd.DataFrame] = None,      # item 8: AIC audit
+    dr_audit: Optional[pd.DataFrame] = None,     
     run_info:   Optional[Dict[str, Any]] = None,  
     out_dir: Path,
     zip_name: str = "grofit_outputs.zip",
     cleanup_csv: bool = True,
 ) -> Dict[str, Any]:
-    """Write Grofit-compatible CSV outputs + optional audit tables."""
     import datetime
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -37,15 +35,10 @@ def export_results_zip(
         _write(gc_boot, "gcBoot.csv")
     if dr_boot is not None and not dr_boot.empty:
         _write(dr_boot, "drBoot.csv")
-    # item 8: AIC/model-selection audit table
     if dr_audit is not None and not dr_audit.empty:
         _write(dr_audit, "drAudit.csv")
-
-    # item 12: manifest with version + timestamp
-    from .pipeline import PIPELINE_VERSION, SCHEMA_VERSION
+    
     manifest = pd.DataFrame([{
-        "pipeline_version": PIPELINE_VERSION,
-        "schema_version": SCHEMA_VERSION,
         "generated_utc": datetime.datetime.utcnow().isoformat(),
         "gc_curves": len(gc_fit),
         "dr_experiments": len(dr_fit),

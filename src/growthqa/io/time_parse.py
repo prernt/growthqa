@@ -1,8 +1,6 @@
 from __future__ import annotations
-
 import re
 from typing import Optional
-
 import numpy as np
 import pandas as pd
 
@@ -16,7 +14,6 @@ def _to_float(x) -> float:
     s = str(x).strip()
     if s == "":
         return np.nan
-    # allow comma decimal
     s = s.replace(",", ".")
     try:
         return float(s)
@@ -24,13 +21,6 @@ def _to_float(x) -> float:
         return np.nan
 
 def parse_time_any_to_hours(x) -> float:
-    """
-    Parse time strings/numbers to hours.
-    Accepts:
-      - numeric (assumed already hours unless later unit-detected)
-      - "90m", "1h 30m", "5400s"
-      - "0", "t0"
-    """
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return np.nan
 
@@ -41,7 +31,6 @@ def parse_time_any_to_hours(x) -> float:
     if s in {"t0", "to", "t 0", "0"}:
         return 0.0
 
-    # pure numeric string
     numeric = _to_float(s)
     if np.isfinite(numeric):
         return float(numeric)
@@ -58,10 +47,6 @@ def parse_time_any_to_hours(x) -> float:
 WELL_RE = re.compile(r"\(([A-Z]\d{2})\)\s*$", re.I)
 
 def split_condition_and_well(colname: str) -> tuple[str, str]:
-    """
-    '10.2N 5 c KCl 25 mM (A01)' -> ('10.2N 5 c KCl 25 mM', 'A01')
-    If no (A01) found, well='UNK' and condition=colname.
-    """
     s = str(colname).strip()
     m = WELL_RE.search(s)
     if m:
@@ -72,14 +57,6 @@ def split_condition_and_well(colname: str) -> tuple[str, str]:
 
 
 def infer_and_convert_numeric_time_to_hours(t: pd.Series, hinted_unit: Optional[str] = None) -> pd.Series:
-    """
-    If times are numeric, infer whether they're hours/minutes/seconds.
-    Heuristic:
-      - If hinted_unit provided, obey it.
-      - Else if median step > 100 -> seconds
-      - Else if max(t) > 50 and max(t) <= 5000 -> minutes (e.g., up to a few days)
-      - Else assume hours
-    """
     tt = pd.to_numeric(t, errors="coerce")
     tt = tt.astype(float)
 
@@ -91,7 +68,6 @@ def infer_and_convert_numeric_time_to_hours(t: pd.Series, hinted_unit: Optional[
             return tt / 60.0
         if u in {"h", "hr", "hrs", "hour", "hours"}:
             return tt
-        # unknown hint -> fall through
 
     finite = tt[np.isfinite(tt)]
     if finite.empty:
@@ -106,16 +82,12 @@ def infer_and_convert_numeric_time_to_hours(t: pd.Series, hinted_unit: Optional[
 
     mx = float(np.nanmax(finite_sorted))
 
-    # crude heuristics; you can tighten later once you see your real files
     if np.isfinite(med_step) and med_step > 100:
-        # likely seconds
         return tt / 3600.0
 
     if mx > 50 and mx <= 5000:
-        # likely minutes (e.g., 0..1500 minutes)
         return tt / 60.0
 
-    # default assume hours
     return tt
 
 

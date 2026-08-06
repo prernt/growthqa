@@ -5,17 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "growthqa"
 version = "0.1.0"
-description = "GrowthQC: preprocessing, metadata extraction and classification of bacterial growth curves"
+description = "GrowthQa: preprocessing, metadata extraction and classification of bacterial growth curves"
 authors = [{ name = "Prerna Thapliyal" }]
 readme = "README.md"
-requires-python = ">=3.9,<3.13"
+requires-python = ">=3.11,<3.12"
 
 dependencies = [
-    "numpy",
-    "pandas",
-    "scipy",
+    "numpy==1.23.5",
+    "pandas==1.5.2",
+    "scipy==1.15.3",
     "statsmodels",
-    "scikit-learn",
+    "scikit-learn==1.2.0",
     "joblib",
     "openpyxl",
     "matplotlib",

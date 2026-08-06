@@ -1,55 +1,9 @@
 from __future__ import annotations
-
 from typing import Dict, List, Tuple
-
 import numpy as np
 import pandas as pd
-
 from growthqa.preprocess.timegrid import parse_time_from_header
 from growthqa.preprocess.transform import rolling_smooth
-
-_HAS_SCIPY = False
-try:
-    from scipy.optimize import curve_fit, OptimizeWarning  # type: ignore
-    import warnings
-
-    warnings.filterwarnings("ignore", category=OptimizeWarning)
-    _HAS_SCIPY = True
-except Exception:
-    _HAS_SCIPY = False
-
-
-def _logistic_model(t, A, mu, lam):
-    return A / (1.0 + np.exp(-mu * (t - lam)))
-
-
-def _gompertz_model(t, A, mu, lam):
-    inner = (mu * np.e / max(A, 1e-9)) * (lam - t) + 1.0
-    inner = np.clip(inner, -50, 50)
-    return A * np.exp(-np.exp(inner))
-
-
-def _richards_model(t, A, mu, lam, nu):
-    nu = max(float(nu), 1e-3)
-    expo = np.clip(-mu * (t - lam), -50.0, 50.0)
-    term = nu * np.exp(expo)
-    log_denom = np.clip((1.0 / nu) * np.log1p(term), -50.0, 50.0)
-    denom = np.exp(log_denom)
-    return A / denom
-
-
-def _flat_model(t, c):
-    return np.full_like(t, float(c), dtype=float)
-
-
-def _aic_from_residuals(resid: np.ndarray, k_params: int) -> float:
-    resid = np.array(resid, dtype=float)
-    n = int(np.sum(np.isfinite(resid)))
-    if n <= 0:
-        return np.nan
-    rss = float(np.nansum(resid ** 2))
-    rss = max(rss, 1e-12)
-    return float(n * np.log(rss / n) + 2 * int(k_params))
 
 
 def _safe_label(v):
@@ -67,14 +21,7 @@ def _time_cols_from_row(row: pd.Series) -> List[str]:
     return sorted(cols, key=lambda c: parse_time_from_header(str(c)) or 0.0)
 
 
-# Late-window growth features (observations beyond the 16 h training horizon) are
-# not produced here. Stage 1 is trained only on the 0-16 h window, so these values
-# are constant within training_meta.csv and carry no signal for the classifier. The live
-# late-window analysis used at inference belongs to Stage 2 and is implemented in
-# growthqa.stage2.late_window.
-
-
-def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dict[str, object]:
+def compute_features_from_row(row: pd.Series) -> Dict[str, object]:
     time_cols = _time_cols_from_row(row)
     t_all = np.array([parse_time_from_header(str(c)) for c in time_cols], dtype=float)
     y_all = pd.to_numeric(row[time_cols], errors="coerce").to_numpy(dtype=float)
@@ -84,36 +31,39 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
     od = y_all[finite]
 
     observed_tmax = float(np.nanmax(t)) if t.size else np.nan
-    n_points_observed = int(t.size)
-
+    n_points_observed_grid = int(t.size)
     if t.size >= 2:
         t_sorted = np.sort(t)
         dt = np.diff(t_sorted)
-        max_gap_hours = float(np.nanmax(dt)) if dt.size else np.nan
+        max_gap_hours_grid = float(np.nanmax(dt)) if dt.size else np.nan
         median_dt_hours = float(np.nanmedian(dt)) if dt.size else np.nan
     else:
-        max_gap_hours = np.nan
+        max_gap_hours_grid = np.nan
         median_dt_hours = np.nan
 
     if np.isfinite(observed_tmax):
         in_range = (t_all >= 0) & (t_all <= observed_tmax)
         denom = int(np.sum(in_range))
         numer = int(np.sum(in_range & ~np.isfinite(y_all)))
-        missing_frac_on_grid = float(numer / denom) if denom > 0 else np.nan
+        missing_frac_on_grid_calc = float(numer / denom) if denom > 0 else np.nan
     else:
-        missing_frac_on_grid = np.nan
+        missing_frac_on_grid_calc = np.nan
 
-    low_res_ctx = (
+    _raw_n = row.get("n_points_observed_raw", None)
+    _raw_gap = row.get("max_gap_hours_raw", None)
+    _raw_missing = row.get("missing_frac_on_grid_raw", None)
+
+    n_points_observed = int(_raw_n) if _raw_n is not None and pd.notna(_raw_n) else n_points_observed_grid
+    max_gap_hours = float(_raw_gap) if _raw_gap is not None and pd.notna(_raw_gap) else max_gap_hours_grid
+    missing_frac_on_grid = (
+        float(_raw_missing) if _raw_missing is not None and pd.notna(_raw_missing) else missing_frac_on_grid_calc
+    )
+    sparse_ctx = bool(row.get("too_sparse", False))
+    grid_resolution_mismatch = (
         (np.isfinite(median_dt_hours) and median_dt_hours > 0.5)
-        or (n_points_observed > 0 and n_points_observed < 10)
-        or bool(row.get("low_resolution", False))
-    )
-    sparse_ctx = (
-        (np.isfinite(max_gap_hours) and max_gap_hours > 2.0)
+        or (np.isfinite(max_gap_hours) and max_gap_hours > 2.0)
         or (np.isfinite(missing_frac_on_grid) and missing_frac_on_grid > 0.25)
-        or bool(row.get("too_sparse", False))
     )
-
     train_horizon = pd.to_numeric(pd.Series([row.get("train_horizon", np.nan)]), errors="coerce").iloc[0]
     if not np.isfinite(train_horizon):
         train_horizon = 16.0
@@ -129,15 +79,11 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
             "is_censored": is_censored,
             "n_points_observed": n_points_observed,
             "max_gap_hours": max_gap_hours,
-            "median_dt_hours": median_dt_hours,
             "missing_frac_on_grid": missing_frac_on_grid,
-            "low_resolution": int(low_res_ctx),
             "too_sparse": int(sparse_ctx),
+            "grid_resolution_mismatch": int(grid_resolution_mismatch),
             "initial_OD": np.nan,
             "final_OD": np.nan,
-            "max_OD": np.nan,
-            "min_OD": np.nan,
-            "range_OD": np.nan,
             "auc": np.nan,
             "auc_per_hour": np.nan,
             "net_change_per_hour": np.nan,
@@ -146,23 +92,15 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
             "time_of_max_OD": np.nan,
             "monotonicity_fraction": np.nan,
             "largest_drop_frac": np.nan,
-            "dip_fraction": np.nan,
             "roughness": np.nan,
             "noise_residual_std": np.nan,
+            "noise_residual_std_is_fallback": np.nan,
             "lag_time_est": np.nan,
             "plateau_OD": np.nan,
             "growth_phase_duration": np.nan,
             "symmetry_factor": np.nan,
-            "final_to_peak_ratio": np.nan,
             "num_slope_sign_changes": np.nan,
             "multi_phase_flag": np.nan,
-            "logistic_fit_mse": np.nan,
-            "logistic_AIC": np.nan,
-            "gompertz_AIC": np.nan,
-            "richards_AIC": np.nan,
-            "flat_AIC": np.nan,
-            "best_model_AIC": np.nan,
-            "best_model_name": np.nan,
         }
 
     order = np.argsort(t)
@@ -186,7 +124,6 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
         dy = np.array([], dtype=float)
         dt = np.array([], dtype=float)
         slopes = np.array([], dtype=float)
-
     auc_per_hour = float(auc / observed_tmax) if np.isfinite(observed_tmax) and observed_tmax > 0 else np.nan
     net_change_per_hour = (
         float((final_od - initial_od) / observed_tmax)
@@ -205,17 +142,24 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
     time_of_max_od = float(t[i_max])
     mono = float(np.mean(dy > 0)) if dy.size > 0 else np.nan
     largest_drop_frac = np.nan
-    if dy.size > 0 and range_od > 1e-9 and np.any(dy < 0):
-        largest_drop_frac = float(abs(np.nanmin(dy)) / range_od)
-    dip_fraction = np.nan
-    if dy.size > 0 and range_od > 1e-9:
-        dip_fraction = float(np.sum(np.clip(-dy, 0, None)) / range_od)
+    if dy.size > 0:
+        if range_od > 1e-9:
+            largest_drop_frac = float(abs(np.nanmin(dy)) / range_od) if np.any(dy < 0) else 0.0
+        else:
+            largest_drop_frac = 0.0  # flat curve: no variation, no drop possible
 
     roughness = float(np.nanstd(dy)) if dy.size > 0 else np.nan
     noise_residual_std = np.nan
-    if od.size >= 8:
+    noise_residual_std_is_fallback = False
+    
+    if n_points_observed >= 8:
         base = rolling_smooth(od, window=5)
         noise_residual_std = float(np.nanstd(od - base))
+    elif n_points_observed >= 4:
+        d = np.diff(od)
+        if d.size > 0:
+            noise_residual_std = float(np.nanstd(d) / np.sqrt(2.0))
+            noise_residual_std_is_fallback = True
 
     lag_time = np.nan
     if range_od > 1e-9:
@@ -241,7 +185,6 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
     symmetry_factor = (
         float((time_of_max_od - t[0]) / total_dur) if np.isfinite(total_dur) and total_dur > 1e-12 else np.nan
     )
-    final_to_peak_ratio = float(final_od / max_od) if max_od > 1e-12 else np.nan
     num_slope_sign_changes = 0
     if slopes.size and np.any(np.isfinite(slopes)):
         s = np.sign(slopes.copy())
@@ -252,77 +195,32 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
         if nz.size > 1:
             num_slope_sign_changes = int(np.sum(np.diff(nz) != 0))
 
-    multi_phase_flag = False
-    if od.size >= 7 and range_od > 1e-9:
-        local_max_idxs = []
-        for i in range(1, len(od) - 1):
-            if od[i] >= od[i - 1] and od[i] >= od[i + 1]:
-                local_max_idxs.append(i)
-        if len(local_max_idxs) >= 2:
-            p1, p2 = local_max_idxs[0], local_max_idxs[-1]
-            if (od[p1] - initial_od) > 0.2 * range_od and (od[p2] - initial_od) > 0.2 * range_od:
-                mid_min = float(np.min(od[p1:p2 + 1]))
-                if (max_od - mid_min) > 0.2 * range_od:
-                    multi_phase_flag = True
-
-    logistic_fit_mse = np.nan
-    logistic_AIC = np.nan
-    gompertz_AIC = np.nan
-    richards_AIC = np.nan
-    flat_AIC = np.nan
-    best_model_AIC = np.nan
-    best_model_name = np.nan
-    if rich_meta and _HAS_SCIPY and t.size >= 5:
-        fit_residuals: Dict[str, Tuple[np.ndarray, int]] = {}
-        try:
-            popt_log, _ = curve_fit(_logistic_model, t, od, p0=[max_od, 1.0, float(np.median(t))], maxfev=2000)
-            resid = od - _logistic_model(t, *popt_log)
-            logistic_fit_mse = float(np.mean(resid ** 2))
-            fit_residuals["Logistic"] = (resid, 3)
-        except Exception:
-            pass
-        try:
-            popt_gom, _ = curve_fit(_gompertz_model, t, od, p0=[max_od, 1.0, float(np.median(t))], maxfev=2000)
-            fit_residuals["Gompertz"] = (od - _gompertz_model(t, *popt_gom), 3)
-        except Exception:
-            pass
-        try:
-            popt_r, _ = curve_fit(_richards_model, t, od, p0=[max_od, 1.0, float(np.median(t)), 1.0], maxfev=4000)
-            fit_residuals["Richards"] = (od - _richards_model(t, *popt_r), 4)
-        except Exception:
-            pass
-        fit_residuals["Flat"] = (od - _flat_model(t, float(np.nanmean(od))), 1)
-
-        logistic_AIC = _aic_from_residuals(*fit_residuals["Logistic"]) if "Logistic" in fit_residuals else np.nan
-        gompertz_AIC = _aic_from_residuals(*fit_residuals["Gompertz"]) if "Gompertz" in fit_residuals else np.nan
-        richards_AIC = _aic_from_residuals(*fit_residuals["Richards"]) if "Richards" in fit_residuals else np.nan
-        flat_AIC = _aic_from_residuals(*fit_residuals["Flat"]) if "Flat" in fit_residuals else np.nan
-        aics = {
-            "Logistic": logistic_AIC,
-            "Gompertz": gompertz_AIC,
-            "Richards": richards_AIC,
-            "Flat": flat_AIC,
-        }
-        finite_aics = {k: v for k, v in aics.items() if np.isfinite(v)}
-        if finite_aics:
-            best_model_name = min(finite_aics, key=finite_aics.get)
-            best_model_AIC = float(finite_aics[best_model_name])
-
+    multi_phase_flag = np.nan
+    
+    if n_points_observed >= 7:
+        multi_phase_flag = False
+        if range_od > 1e-9:
+            local_max_idxs = []
+            for i in range(1, len(od) - 1):
+                if od[i] >= od[i - 1] and od[i] >= od[i + 1]:
+                    local_max_idxs.append(i)
+            if len(local_max_idxs) >= 2:
+                p1, p2 = local_max_idxs[0], local_max_idxs[-1]
+                if (od[p1] - initial_od) > 0.2 * range_od and (od[p2] - initial_od) > 0.2 * range_od:
+                    mid_min = float(np.min(od[p1:p2 + 1]))
+                    if (max_od - mid_min) > 0.2 * range_od:
+                        multi_phase_flag = True
     return {
         "train_horizon": float(train_horizon),
         "observed_tmax": observed_tmax,
         "is_censored": int(is_censored),
         "n_points_observed": n_points_observed,
         "max_gap_hours": max_gap_hours,
-        "median_dt_hours": median_dt_hours,
         "missing_frac_on_grid": missing_frac_on_grid,
-        "low_resolution": int(low_res_ctx),
         "too_sparse": int(sparse_ctx),
+        "grid_resolution_mismatch": int(grid_resolution_mismatch),
         "initial_OD": initial_od,
         "final_OD": final_od,
-        "max_OD": max_od,
-        "min_OD": min_od,
-        "range_OD": range_od,
         "auc": auc,
         "auc_per_hour": auc_per_hour,
         "net_change_per_hour": net_change_per_hour,
@@ -331,30 +229,22 @@ def compute_features_from_row(row: pd.Series, *, rich_meta: bool = False) -> Dic
         "time_of_max_OD": time_of_max_od,
         "monotonicity_fraction": mono,
         "largest_drop_frac": largest_drop_frac,
-        "dip_fraction": dip_fraction,
         "roughness": roughness,
         "noise_residual_std": noise_residual_std,
+        "noise_residual_std_is_fallback": int(noise_residual_std_is_fallback),
         "lag_time_est": lag_time,
         "plateau_OD": plateau_od,
         "growth_phase_duration": growth_phase_duration,
         "symmetry_factor": symmetry_factor,
-        "final_to_peak_ratio": final_to_peak_ratio,
         "num_slope_sign_changes": num_slope_sign_changes,
-        "multi_phase_flag": int(bool(multi_phase_flag)),
-        "logistic_fit_mse": logistic_fit_mse,
-        "logistic_AIC": logistic_AIC,
-        "gompertz_AIC": gompertz_AIC,
-        "richards_AIC": richards_AIC,
-        "flat_AIC": flat_AIC,
-        "best_model_AIC": best_model_AIC,
-        "best_model_name": best_model_name,
+        "multi_phase_flag": (np.nan if pd.isna(multi_phase_flag) else int(bool(multi_phase_flag))),
     }
 
 
-def build_metadata_from_wide(final_wide: pd.DataFrame, *, rich_meta: bool = False) -> pd.DataFrame:
+def build_metadata_from_wide(final_wide: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for _, r in final_wide.iterrows():
-        feats = compute_features_from_row(r, rich_meta=rich_meta)
+        feats = compute_features_from_row(r)
         source_type = str(r.get("source_type", "")).strip().lower()
         if source_type not in {"synthetic", "lab"}:
             fname = str(r.get("FileName", "")).lower()
@@ -368,12 +258,13 @@ def build_metadata_from_wide(final_wide: pd.DataFrame, *, rich_meta: bool = Fals
             "Model Name": r.get("Model Name"),
             "Concentration": r.get("Concentration", np.nan),
             "Is_Valid": _safe_label(r.get("Is_Valid", pd.NA)),
-            "had_outliers": int(bool(r.get("had_outliers", False))),
             "source_type": source_type,
             "is_synthetic": int(is_synth),
             "base_curve_id": r.get("base_curve_id"),
             "aug_id": r.get("aug_id"),
             "tmax_original": r.get("tmax_original", np.nan),
+            "gap_augmented": int(pd.to_numeric(pd.Series([r.get("gap_augmented", 0)]), errors="coerce").fillna(0).iloc[0]),
+            "gap_pattern": r.get("gap_pattern", None),
             **feats,
         }
         rows.append(row)

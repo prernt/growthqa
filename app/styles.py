@@ -1,6 +1,6 @@
-# app/styles.py
+
 """
-Injects the application-wide CSS.  Call ``inject_css()`` once at page top.
+Injects the application-wide CSS.
 """
 from __future__ import annotations
 import streamlit as st
@@ -89,7 +89,6 @@ div[data-testid="stFileUploader"]:has(input[id="manual_review_upload"]) button s
 div[data-testid="stFileUploader"]:has(input[id="manual_review_upload"]) button::before { content:"#7B Upload True Labels"; }
 </style>
 """
-
 
 def inject_css() -> None:
     st.markdown(_CSS, unsafe_allow_html=True)

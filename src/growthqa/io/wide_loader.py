@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import argparse
 import logging
 import os
@@ -52,15 +51,7 @@ def load_wide_csv(path: str) -> pd.DataFrame:
     if not tcols:
         raise ValueError(f"{path}: No time columns like 'T0.00 (h)' found.")
 
-    # strict boolean Is_Valid
     df["Is_Valid"] = coerce_is_valid_bool(df["Is_Valid"])
-
-    # Domain flags (kept explicit in meta to mitigate synthetic/lab shift).
-    # Prefer content-based detection via the "Curve Subtype" marker column
-    # (present only in synthetically generated wide CSVs) over filename
-    # inference, since filenames are not a reliable signal (e.g. a file
-    # named "timeseries_wide_SD1.csv" contains no "syn" substring even
-    # though every row in it is synthetic).
     stem = Path(path).stem.lower()
     filename_source = "synthetic" if ("syn" in stem or "synthetic" in stem) else "lab"
     if "Curve Subtype" in df.columns:
@@ -85,13 +76,11 @@ def load_wide_csv(path: str) -> pd.DataFrame:
             (df["source_type"] == "synthetic").astype(int)
         ).astype(int)
 
-    # keep only known columns (plus optional Concentration)
     keep = REQUIRED_META_COLS + ["source_type", "is_synthetic"] + tcols
     if "Concentration" in df.columns:
         keep = REQUIRED_META_COLS + ["Concentration", "source_type", "is_synthetic"] + tcols
     df = df[keep].copy()
 
-    # numeric timeseries
     for c in tcols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -102,7 +91,6 @@ def load_and_concat_wides(paths: List[str]) -> pd.DataFrame:
     dfs = []
     for p in paths:
         if not os.path.exists(p):
-            # logging.warning(f"Skipping missing input: {p}")
             continue
         dfs.append(load_wide_csv(p))
     if not dfs:

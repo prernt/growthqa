@@ -1,8 +1,6 @@
 from __future__ import annotations
-
 import re
 from typing import List, Optional
-
 import numpy as np
 
 _TIME_COL_RE = re.compile(r"^\s*T\s*([0-9]+(?:\.[0-9]+)?)\s*\(h\)\s*$", re.I)
@@ -32,13 +30,11 @@ def get_time_columns(df) -> List[str]:
 
 
 def get_sorted_time_columns(df) -> List[str]:
-    """Same as get_time_columns, but sorted by parsed time value."""
     cols = get_time_columns(df)
     return sorted(cols, key=lambda c: float(parse_time_from_header(str(c)) or 0.0))
 
 
 def build_common_grid(step_hours: float, tmax_hours: float) -> np.ndarray:
-    """Canonical 0..tmax grid at a fixed step. tmax is always supplied."""
     tmax = max(0.0, float(tmax_hours))
     n = max(int(np.floor(tmax / step_hours + 1e-9)) + 1, 1)
     return step_hours * np.arange(n, dtype=float)

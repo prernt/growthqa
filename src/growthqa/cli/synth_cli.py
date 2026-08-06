@@ -1,10 +1,7 @@
-# src/growthqa/cli/synth_cli.py
 from __future__ import annotations
-
 import argparse
 import logging
 import os
-
 import growthqa.synthetic.timeseries_curve_data as timeseries_curve_data
 
 def add_synth_subcommand(subparsers: argparse._SubParsersAction) -> None:

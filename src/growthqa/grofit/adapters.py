@@ -1,20 +1,12 @@
 from __future__ import annotations
-
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
-
 import numpy as np
 import pandas as pd
 
-
-# ------------------------------------------------------------
-# Config
-# ------------------------------------------------------------
-
 @dataclass(frozen=True)
 class GrofitAdapterConfig:
-    # required output schema for grofit pipeline
     out_test_id: str = "test_id"          # experiment/group
     out_curve_id: str = "curve_id"        # curve replicate / well
     out_conc: str = "concentration"       # dose (float)
@@ -22,13 +14,9 @@ class GrofitAdapterConfig:
     out_y: str = "y"                     # observation (float)
     out_is_valid: str = "is_valid"       # boolean
 
-    # common incoming column aliases
     time_col_aliases: Tuple[str, ...] = ("Time (h)", "time", "Time", "t", "T")
     test_id_aliases: Tuple[str, ...] = ("test_id", "Test Id", "TestID", "testid")
-    # curve_id_aliases: Tuple[str, ...] = ("curve_id", "Curve Id", "CurveID", "well", "Well")
     conc_aliases: Tuple[str, ...] = ("concentration", "Concentration", "conc", "Conc", "dose", "Dose")
-
-    # prediction/meta output aliases
     pred_test_id_aliases: Tuple[str, ...] = ("Test Id", "test_id", "TestID")
     pred_label_aliases: Tuple[str, ...] = ("Predicted Label", "pred_label", "label", "Label", "is_valid", "valid")
     pred_pvalid_aliases: Tuple[str, ...] = (
@@ -43,10 +31,6 @@ _TIME_PATTERNS = (
 )
 _TIME_REGEXES = [re.compile(p, re.IGNORECASE) for p in _TIME_PATTERNS]
 
-
-# ------------------------------------------------------------
-# Small helpers
-# ------------------------------------------------------------
 
 def _first_existing_col(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
     cols = list(df.columns)
@@ -95,21 +79,7 @@ def _coerce_is_valid_from_label(x) -> Optional[bool]:
     return None
 
 
-# ------------------------------------------------------------
-# Key logic for your project outputs:
-# predictions use Test Id like "testSample1_BY4741"
-# ------------------------------------------------------------
-
 def split_pred_test_id(pred_test_id: Union[str, int, float], delim: str = "_") -> Tuple[str, str]:
-    """
-    Split prediction 'Test Id' into (test_id, curve_id).
-
-    For your outputs:
-      "testSample1_BY4741" -> ("testSample1", "BY4741")
-
-    Rule:
-      split on last delimiter (safer if test_id contains underscores).
-    """
     s = str(pred_test_id)
     if delim not in s:
         return s, s  # fallback: can't split -> treat both same
@@ -125,14 +95,6 @@ def predictions_to_curve_map(
     prefer_label: bool = True,
     valid_threshold: float = 0.5,
 ) -> pd.DataFrame:
-    """
-    Convert predictions/meta_debug file into a mapping table:
-      test_id, curve_id, is_valid
-
-    Supports:
-      - Predicted Label (Valid/Invalid/Unsure)
-      - or Confidence (Valid) / p_valid with threshold
-    """
     df = predictions_df.copy()
 
     pred_tid_col = _first_existing_col(df, config.pred_test_id_aliases)
@@ -169,10 +131,6 @@ def predictions_to_curve_map(
     return out
 
 
-# ------------------------------------------------------------
-# Adapters for the two input formats you use
-# ------------------------------------------------------------
-
 def input_time_well_to_tidy(
     df: pd.DataFrame,
     *,
@@ -181,13 +139,6 @@ def input_time_well_to_tidy(
     concentration_map: Optional[Dict[str, float]] = None,
     drop_na_y: bool = True,
 ) -> pd.DataFrame:
-    """
-    For testSample1.csv shape:
-      Time (h) | BY4741 | trk1trk2 | ...
-
-    Produces tidy:
-      test_id, curve_id, concentration, time, y
-    """
     src = df.copy()
     time_col = _first_existing_col(src, config.time_col_aliases)
     if time_col is None:
@@ -232,13 +183,6 @@ def input_wide_curve_rows_to_tidy(
     concentration_col: Optional[str] = None,
     drop_na_y: bool = True,
 ) -> pd.DataFrame:
-    """
-    For __testSample1.csv shape:
-      Test Id | T0.00 (h) | T0.50 (h) | ... | T7.00 (h)
-
-    One row = one curve_id (from Test Id column in that file).
-    test_id (experiment) can be provided via file_test_id.
-    """
     src = df.copy()
 
     test_id_col = test_id_col or _first_existing_col(src, config.test_id_aliases)
@@ -280,10 +224,6 @@ def input_wide_curve_rows_to_tidy(
     return tidy[[config.out_test_id, config.out_curve_id, config.out_conc, config.out_time, config.out_y]]
 
 
-# ------------------------------------------------------------
-# Attach validity to tidy curves (using your prediction outputs)
-# ------------------------------------------------------------
-
 def attach_validity_from_predictions(
     tidy_df: pd.DataFrame,
     predictions_df: pd.DataFrame,
@@ -294,12 +234,6 @@ def attach_validity_from_predictions(
     valid_threshold: float = 0.5,
     default_if_missing: bool = False,
 ) -> pd.DataFrame:
-    """
-    Join is_valid onto tidy curves using your prediction outputs.
-
-    - predictions_df has Test Id like "testSample1_BY4741"
-    - tidy_df has test_id = "testSample1" (file_test_id) and curve_id = "BY4741"
-    """
     out = tidy_df.copy()
 
     required = [config.out_test_id, config.out_curve_id, config.out_conc, config.out_time, config.out_y]

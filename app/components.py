@@ -1,4 +1,3 @@
-# app/components.py
 """
 Reusable Streamlit UI primitives: pills, error display, metric rows.
 """
@@ -12,7 +11,6 @@ def st_pills_multi(
     default: list[str] | None = None,
     key: str | None = None,
 ) -> list[str]:
-    """Backward-compatible multi-select pills (st.pills or st.multiselect)."""
     default_vals = [str(v) for v in (default or []) if str(v) in {str(o) for o in options}]
     if hasattr(st, "pills"):
         sel = st.pills(label, options=options, default=default_vals,
@@ -36,7 +34,6 @@ def show_friendly_error(exc: Exception) -> None:
 
 def render_metric_row(label: str, value: str | None = None,
                       font: str = "1.1rem") -> None:
-    """Two-column label / value row used in the right metrics panel."""
     r_label, r_value = st.columns([1.2, 1.8], gap="small")
     r_label.markdown(
         f"<div style='font-size:{font};font-weight:600;'>{label}</div>",
@@ -51,7 +48,6 @@ def render_metric_row(label: str, value: str | None = None,
 def render_select_row(label: str, options_list: list[str],
                       index_val: int, key_val: str,
                       font: str = "1.1rem") -> str:
-    """Two-column label / selectbox row."""
     r_label, r_value, _ = st.columns([1.2, 0.78, 1.02], gap="small")
     r_label.markdown(
         f"<div style='font-size:{font};font-weight:600;'>{label}</div>",

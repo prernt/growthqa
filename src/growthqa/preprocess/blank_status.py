@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 from typing import Dict, Optional
-
 import numpy as np
 import pandas as pd
 
@@ -18,10 +16,6 @@ def _norm_blank_flag(x: object) -> str:
 
 
 def load_blank_status_map(path: Optional[str]) -> Dict[str, Dict[str, object]]:
-    """
-    Returns dict:
-      { FileName: {"status": "ALREADY"|"RAW", "blank_value": float|None} }
-    """
     if not path:
         return {}
     df = pd.read_csv(path)

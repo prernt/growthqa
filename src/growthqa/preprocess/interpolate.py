@@ -1,10 +1,7 @@
 from __future__ import annotations
-
 from typing import List
-
 import numpy as np
 import pandas as pd
-
 from growthqa.io.wide_loader import REQUIRED_META_COLS
 from growthqa.preprocess.timegrid import (
     build_common_grid,
@@ -26,6 +23,8 @@ def _get_meta_cols(df_wide: pd.DataFrame) -> List[str]:
         "is_censored",
         "source_type",
         "is_synthetic",
+        "gap_augmented",
+        "gap_pattern",
     ]:
         if c in df_wide.columns and c not in cols:
             cols.append(c)
@@ -63,7 +62,6 @@ def interpolate_linear_no_extrap(t_src: np.ndarray, y_src: np.ndarray, t_grid: n
     t = t[order]
     y = y[order]
 
-    # de-duplicate times (mean duplicates)
     uniq_t, inv = np.unique(t, return_inverse=True)
     if uniq_t.size != t.size:
         y_acc = np.zeros_like(uniq_t, dtype=float)
@@ -88,9 +86,7 @@ def interpolate_linear_no_extrap(t_src: np.ndarray, y_src: np.ndarray, t_grid: n
 def build_raw_merged(df_all_wide: pd.DataFrame,
                      step_hours: float,
                      min_points: int,
-                     tmax_hours: float,
-                     low_res_threshold: int) -> pd.DataFrame:
-    """Interpolate every original curve onto the canonical 0..tmax grid."""
+                     tmax_hours: float) -> pd.DataFrame:
     long = wide_to_long(df_all_wide)
 
     t_grid = build_common_grid(step_hours=step_hours, tmax_hours=tmax_hours)
@@ -111,18 +107,41 @@ def build_raw_merged(df_all_wide: pd.DataFrame,
         n_fin = int(np.sum(finite))
 
         too_sparse = n_fin < int(min_points)
-        low_resolution = (n_fin >= int(min_points)) and (n_fin < int(low_res_threshold))
+        if n_fin >= 2:
+            t_fin_sorted = np.sort(t_src[finite])
+            raw_gaps = np.diff(t_fin_sorted)
+            raw_max_gap_hours = float(np.max(raw_gaps)) if raw_gaps.size else 0.0
+            raw_span_hours = float(t_fin_sorted[-1] - t_fin_sorted[0])
+            expected_pts = int(round(raw_span_hours / float(step_hours))) + 1 if raw_span_hours > 0 else 1
+            raw_missing_frac_on_grid = (
+                float(max(0, expected_pts - n_fin) / expected_pts) if expected_pts > 0 else np.nan
+            )
+        elif n_fin == 1:
+            raw_max_gap_hours = np.nan
+            raw_missing_frac_on_grid = 0.0
+        else:
+            raw_max_gap_hours = np.nan
+            raw_missing_frac_on_grid = np.nan
 
         y_grid = (
             interpolate_linear_no_extrap(t_src, y_src, t_grid)
             if not too_sparse else np.full_like(t_grid, np.nan, dtype=float)
         )
 
-        row = {**meta, "too_sparse": bool(too_sparse), "low_resolution": bool(low_resolution)}
+        row = {
+            **meta,
+            "too_sparse": bool(too_sparse),
+            "n_points_observed_raw": int(n_fin),
+            "max_gap_hours_raw": raw_max_gap_hours,
+            "missing_frac_on_grid_raw": raw_missing_frac_on_grid,
+        }
         for h, v in zip(time_headers, y_grid):
             row[h] = float(v) if np.isfinite(v) else np.nan
 
         rows.append(row)
 
-    cols = meta_cols + ["too_sparse", "low_resolution"] + time_headers
+    cols = meta_cols + [
+        "too_sparse",
+        "n_points_observed_raw", "max_gap_hours_raw", "missing_frac_on_grid_raw",
+    ] + time_headers
     return pd.DataFrame(rows)[cols]

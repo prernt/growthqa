@@ -1,8 +1,6 @@
 from __future__ import annotations
-
 import numpy as np
 import pandas as pd
-
 from growthqa.preprocess.timegrid import get_sorted_time_columns
 
 def _with_curve_id(df: pd.DataFrame) -> pd.DataFrame:
@@ -25,14 +23,11 @@ def _with_curve_id(df: pd.DataFrame) -> pd.DataFrame:
 def build_grofit_input_df(
     wide_original_df: pd.DataFrame,
     audit_df: pd.DataFrame,
-    # raw_extra_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     wide = _with_curve_id(wide_original_df if isinstance(wide_original_df, pd.DataFrame) else pd.DataFrame())
     audit = _with_curve_id(audit_df if isinstance(audit_df, pd.DataFrame) else pd.DataFrame())
     if wide.empty:
         return pd.DataFrame()
-
-    # time_cols = _sorted_time_cols(wide)
     time_cols = get_sorted_time_columns(wide)
     merge_keys = ["Test Id", "Concentration"] if ("Concentration" in wide.columns and "Concentration" in audit.columns) else ["curve_id"]
 

@@ -1,14 +1,12 @@
 from __future__ import annotations
-
 import hashlib
 import re
 from typing import Iterable, List
-
 import numpy as np
 import pandas as pd
-
-from growthqa.preprocess.timegrid import parse_time_from_header, get_sorted_time_columns
+from growthqa.preprocess.timegrid import parse_time_from_header, get_sorted_time_columns, build_common_grid
 _FULL_HORIZON_DEFAULT = 16.0
+
 
 def _time_values(time_cols: Iterable[str]) -> np.ndarray:
     return np.array([parse_time_from_header(str(c)) for c in time_cols], dtype=float)
@@ -126,37 +124,27 @@ def sample_valid_horizons(
     return sorted(float(h) for h in picked)
 
 
-def apply_truncation(row: pd.Series, time_cols: List[str], h: float) -> pd.Series:
-    out = row.copy()
-    for c in time_cols:
-        t = parse_time_from_header(str(c))
-        if t is not None and float(t) > float(h) + 1e-9:
-            out[c] = np.nan
-    return out
-
-
-def augment_df(
-    df_wide: pd.DataFrame,
+def augment_raw_wide(
+    df_wide_raw: pd.DataFrame,
     candidate_horizons: List[float],
     *,
     per_curve: int = 3,
     seed: int = 123,
     full_horizon: float = _FULL_HORIZON_DEFAULT,
+    step_hours: float = 0.5,
 ) -> pd.DataFrame:
-     
-    time_cols = get_sorted_time_columns(df_wide)
-    grid_times = _time_values(time_cols)
+    time_cols = get_sorted_time_columns(df_wide_raw)
     if not time_cols:
-        out = df_wide.copy()
+        out = df_wide_raw.copy()
         out["tmax_original"] = np.nan
         return out
-
+    canonical_grid = build_common_grid(step_hours=float(step_hours), tmax_hours=float(full_horizon))
     used_base_ids: set[str] = set()
     missing_conc_counts: dict[str, int] = {}
     rows: list[pd.Series] = []
     candidates = sorted(float(h) for h in candidate_horizons)
 
-    for idx, row in df_wide.iterrows():
+    for idx, row in df_wide_raw.iterrows():
         test_id = _sanitize_token(row.get("Test Id"))
         if not test_id:
             continue
@@ -187,22 +175,26 @@ def augment_df(
             per_curve=per_curve,
             seed=seed,
             base_curve_id=base_curve_id,
-            grid_times=grid_times,
+            grid_times=canonical_grid,
         )
         if len(sampled) < 2:
             continue
 
         for h in sampled:
-            r = apply_truncation(row, time_cols, h)
-            r["base_curve_id"] = base_curve_id
-            r["train_horizon"] = float(h)
-            r["tmax_original"] = float(tmax_original)
-            r["is_censored"] = int(float(h) < float(full_horizon))
-            r["aug_id"] = make_aug_id(base_curve_id, float(h))
-            rows.append(r)
+            out = row.copy()
+            for c in time_cols:
+                t = parse_time_from_header(str(c))
+                if t is not None and float(t) > float(h) + 1e-9:
+                    out[c] = np.nan
+            out["base_curve_id"] = base_curve_id
+            out["train_horizon"] = float(h)
+            out["tmax_original"] = float(tmax_original)
+            out["is_censored"] = int(float(h) < float(full_horizon))
+            out["aug_id"] = make_aug_id(base_curve_id, float(h))
+            rows.append(out)
 
     if not rows:
-        out = df_wide.iloc[0:0].copy()
+        out = df_wide_raw.iloc[0:0].copy()
         out["tmax_original"] = pd.Series(dtype=float)
         return out
     return pd.DataFrame(rows).reset_index(drop=True)

@@ -1,10 +1,7 @@
-# src/growthqa/grofit/gc_boot_spline.py
 from __future__ import annotations
 import numpy as np
 from typing import Dict, Any, Optional, Literal
-
-from .gc_fit_spline import spar_to_lam,gc_fit_spline
-
+from growthqa.grofit.gc_fit_spline import spar_to_lam, gc_fit_spline
 
 BootstrapMethod = Literal["pairs", "residual"]
 
@@ -15,19 +12,12 @@ def gc_boot_spline(
     B: int = 200,
     ci: float = 0.95,
     random_state: Optional[int] = None,
-    spline_s: Optional[float] = None,     # raw λ (backward compat)
-    smooth: Optional[float] = None,       # NEW item 1: spar ∈ (0,1]
-    df: Optional[float] = None,           # NEW item 1: target df
+    spline_s: Optional[float] = None,    
+    smooth: Optional[float] = None,       
+    df: Optional[float] = None,      
     auto_cv: bool = True,
     bootstrap_method: BootstrapMethod = "pairs",
 ) -> Dict[str, Any]:
-    """
-    Bootstrap spline parameters A, mu, lag, integral.
-    Supports:
-      - pairs: resample (t, y) pairs
-      - residual: fit once, resample residuals, refit
-    Returns mean + sd + (lower, upper) CI.
-    """
     rng = np.random.default_rng(random_state)
     t = np.asarray(t, float)
     y = np.asarray(y, float)
@@ -39,14 +29,12 @@ def gc_boot_spline(
     if n < 6:
         return {"success": False, "message": "Need >=6 points for bootstrap", "n": n}
 
-    stats = {"A": [], "mu": [], "lag": [], "integral": []}
+    stats = {"A": [], "mu": [], "lambda": [], "integral": []}
 
     resolved_lam = spline_s
     if smooth is not None and resolved_lam is None:
         resolved_lam = spar_to_lam(smooth)
 
-
-    # Pre-fit once and lock smoothing for all bootstrap resamples.
     locked_s = spline_s
     if locked_s is None:
         pre_fit = gc_fit_spline(t, y, lam=resolved_lam, auto_cv=auto_cv, smooth=smooth, df=df)
@@ -112,7 +100,7 @@ def gc_boot_spline(
         if fit.success:
             stats["A"].append(fit.A)
             stats["mu"].append(fit.mu)
-            stats["lag"].append(fit.lag)
+            stats["lambda"].append(fit.lag)
             stats["integral"].append(fit.integral)
 
     def summarize(arr):

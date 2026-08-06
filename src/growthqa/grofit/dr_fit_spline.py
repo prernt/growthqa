@@ -1,19 +1,11 @@
-# src/growthqa/grofit/dr_fit_spline.py
 from __future__ import annotations
-
 from typing import Any, Dict, Optional
-
 import numpy as np
 from scipy.interpolate import make_smoothing_spline
+from growthqa.grofit.dr_fit_model import dr_fit_model
+from growthqa.grofit.parametric_models import aic_from_rss
+from growthqa.grofit.gc_fit_spline import effective_df, DR_MIN_DF, spar_to_lam, _select_lam_and_fit
 
-from .dr_fit_model import dr_fit_model
-from .parametric_models import aic_from_rss
-from .gc_fit_spline import effective_df, DR_MIN_DF, spar_to_lam, _select_lam_and_fit
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 def _dedupe_sorted_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if x.size <= 1:
@@ -42,12 +34,6 @@ def _pick_ec50_crossing(
     dy: np.ndarray,
     target: float,
 ) -> tuple[float, str]:
-    """Find EC50 crossing on the fitted DR curve.
-    
-    When multiple crossings exist, selects the one at steepest slope (most
-    biologically meaningful). Returns (ec50_in_transformed_x, status_code).
-    Status codes: OK | MULTI_STEEPEST | NO_CROSS_NEAREST | AMBIGUOUS
-    """
     diff = np.asarray(y_hat, float) - float(target)
     xg = np.asarray(x_grid, float)
     dyg = np.asarray(dy, float)
@@ -89,14 +75,10 @@ def _pick_ec50_crossing(
     return float(roots[best_idx][0]), "MULTI_STEEPEST"
 
 def _select_lambda(xt, y, lam, auto_cv, min_df=DR_MIN_DF):
-    """Thin wrapper using the shared GC/DR lambda selection logic (item 2)."""
     
     sp, lam_used, method = _select_lam_and_fit(xt, y, lam=lam, auto_cv=auto_cv, min_df=min_df)
     return sp, lam_used, method
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def dr_fit_spline(
     conc: np.ndarray,
@@ -104,42 +86,16 @@ def dr_fit_spline(
     x_transform: Optional[str] = "log1p",
     lam: Optional[float] = None,
     auto_cv: bool = True,
-    smooth: Optional[float] = None,          # NEW: Grofit-like spar ∈ (0,1]
+    smooth: Optional[float] = None,          
     y_transform: Optional[str] = None,       
     *,
     enforce_monotonic: bool = True,
     fallback_to_4pl: bool = True,
     min_df: float = 3.5,
 ) -> Dict[str, Any]:
-    """
-    Fit a dose-response spline in the style of Grofit R's drFitSpline.
-
-    Key behaviours matching Grofit R:
-    - x transformed by log1p (or log10/none) before fitting, EC50 inverted back.
-    - Spline fit directly on biological (non-normalised) y values.
-    - GCV smoothing selection with a df floor (min_df=3.5) to prevent
-      over-smoothing on sparse DR data (6-10 points), matching R's behaviour.
-    - EC50 = concentration at midpoint of fitted curve endpoints (Grofit def).
-    - EC50_x_transformed = EC50 in transformed x space (reported as 'EC50' in R).
-    - EC50 = back-transformed to original concentration units (R's 'EC50.orig').
-    - Monotonicity check with 4PL fallback if spline is non-monotonic.
-    - fail_reason reported for all NA outputs.
-
-    Parameters
-    ----------
-    conc : array of concentrations (original scale, not transformed).
-    resp : array of response values (e.g., mu from growth curve fit).
-    x_transform : 'log1p' | 'log10' | 'log' | 'none' | None.
-    lam : explicit SciPy smoothing penalty. If None, auto-selected via GCV.
-    auto_cv : if True, use GCV with df floor. If False, use deterministic fallback.
-    enforce_monotonic : if True and spline is non-monotonic, fallback to 4PL.
-    fallback_to_4pl : allow 4PL fallback (only active when enforce_monotonic=True).
-    min_df : minimum effective degrees of freedom floor for GCV (default 3.5).
-              Prevents GCV from producing a straight line on sparse data.
-              Equivalent to R smooth.spline's implicit df constraint.
-    """
     x = np.asarray(conc, float)
     y = np.asarray(resp, float)
+    y_raw = y.copy()  
 
     y_transform_norm = (y_transform or "none").lower()
     if y_transform_norm in {"log1p", "ln1p"}:
@@ -150,6 +106,7 @@ def dr_fit_spline(
         if np.nanmin(y) <= 0.0:
             return {"success": False, "message": "y has values <= 0 for log10", "fail_reason": "dr_y_transform_invalid_nonpositive", "n": int(len(x))}
         y = np.log10(y)
+
     else:
         y_transform_norm = "none"
 
@@ -161,16 +118,17 @@ def dr_fit_spline(
     mask = np.isfinite(x) & np.isfinite(y)
     x = x[mask]
     y = y[mask]
+    y_raw = y_raw[mask]
+
 
     if len(x) < 4:
         return {
             "success": False,
-            "message": "Need >=4 points for dose-response",
+            "message": "Insufficient points for dose-response. Need atleast 6",
             "fail_reason": "insufficient_points",
             "n": len(x),
         }
 
-    # Defensive: treat non-finite lambda inputs as "not provided".
     if lam is not None:
         try:
             lam_num = float(lam)
@@ -178,7 +136,6 @@ def dr_fit_spline(
             lam_num = np.nan
         lam = lam_num if np.isfinite(lam_num) else None
 
-    # --- X transform (on original x, before deduplication) ---
     x_transform_norm = (x_transform or "none").strip().lower()
     if x_transform_norm in {"log10", "log"}:
         pos = x[x > 0]
@@ -197,43 +154,40 @@ def dr_fit_spline(
     else:
         xt = x.copy()
 
-    # --- Sort and dedup on transformed x ---
     order = np.argsort(xt)
     xt = xt[order]
     x = x[order]
     y = y[order]
+    y_raw = y_raw[order]
+
 
     xt_u, inv = np.unique(xt, return_inverse=True)
     if xt_u.size != xt.size:
         y_sum = np.zeros_like(xt_u, dtype=float)
         x_sum = np.zeros_like(xt_u, dtype=float)
+        y_raw_sum = np.zeros_like(xt_u, dtype=float)
         cnt = np.zeros_like(xt_u, dtype=float)
         np.add.at(y_sum, inv, y)
         np.add.at(x_sum, inv, x)
+        np.add.at(y_raw_sum, inv, y_raw)
         np.add.at(cnt, inv, 1.0)
         xt = xt_u
         y = y_sum / np.maximum(cnt, 1.0)
         x = x_sum / np.maximum(cnt, 1.0)
+        y_raw = y_raw_sum / np.maximum(cnt, 1.0)
 
     if len(xt) < 5:
         return {
             "success": False,
-            "message": "Need >=4 unique points for dose-response",
+            "message": "Insufficient points for dose-response.Need atleast 6",
             "fail_reason": "insufficient_unique_points",
             "n": len(xt),
         }
 
-    # --- Lambda selection (GCV with df floor, matching R smooth.spline) ---
     sp, lam_chosen, lam_method = _select_lambda(xt, y, lam=lam, auto_cv=auto_cv, min_df=min_df)
 
-    # --- Fit spline on raw (non-normalised) y values ---
-    # NOTE: We deliberately do NOT min-max normalise y here.
-    # Grofit R fits the spline on raw biological values (e.g., mu in OD/h).
-    # Normalising changes the effective lambda scale and shifts EC50 midpoint
-    # computation, producing EC50 values inconsistent with R's drFitSpline.
     try:
         if lam_method == "gcv_ok":
-            # GCV passed df floor check — refit cleanly with lam=None.
             sp = make_smoothing_spline(xt, y, lam=None)
             lam_out = float("nan")  # GCV-chosen, not user-exposed
         else:
@@ -243,7 +197,6 @@ def dr_fit_spline(
         grid = np.linspace(float(np.min(xt)), float(np.max(xt)), 2000)
         y_hat = sp(grid)
 
-        # Analytical derivative on original axes (no chain rule needed — no normalisation).
         dy = sp.derivative(1)(grid)
 
         dy_abs = np.abs(dy)
@@ -262,7 +215,8 @@ def dr_fit_spline(
 
     # --- Monotonicity fallback to 4PL ---
     if enforce_monotonic and ((not monotonic) or is_linear) and fallback_to_4pl:
-        model_fit = dr_fit_model(x, y)
+        model_fit = dr_fit_model(x, y_raw)
+
         if model_fit.get("success"):
             ec50_4pl = model_fit.get("ec50", np.nan)
             return {
@@ -274,12 +228,13 @@ def dr_fit_spline(
                 "method": "4pl_fallback",
                 "dr_monotonic": True,
                 "lam_method": "4pl",
-                # EC50 in transformed x (same scale as x-axis of fitted curve)
                 "ec50_x_transformed": ec50_4pl,
-                # EC50 in original concentration units (Grofit EC50.orig)
-                "ec50": ec50_4pl,   # 4PL operates on original x, no inversion needed
+                "ec50": ec50_4pl,
+                "ec50_fit_space": "raw_concentration",
                 "ec50_status": "OK",
+                
                 "y_ec50": model_fit.get("y_ec50", np.nan),
+                "y_ec50_orig": model_fit.get("y_ec50", np.nan),
                 "endpoint_low": model_fit.get("bottom", np.nan),
                 "endpoint_high": model_fit.get("top", np.nan),
                 "aic": model_fit.get("aic", np.nan),
@@ -297,18 +252,12 @@ def dr_fit_spline(
             "n": int(len(x)),
         }
 
-    # --- EC50: midpoint of fitted curve endpoints (Grofit R definition) ---
-    # Grofit: target = (y_min_fitted + y_max_fitted) / 2, NOT global min/max of data.
-    # This matches R drFitSpline behaviour.
-    y0 = float(y_hat[0])    # response at lowest concentration
-    y1 = float(y_hat[-1])   # response at highest concentration
+    y0 = float(y_hat[0])   
+    y1 = float(y_hat[-1])
     target = 0.5 * (y0 + y1)
 
     ec50_xt, ec50_status = _pick_ec50_crossing(grid, y_hat, dy, target)
 
-    # --- Back-transform EC50 to original concentration units ---
-    # ec50_x_transformed: EC50 in the transformed x-space (what R reports as 'xEC50')
-    # ec50:               EC50 in original concentration units (what R reports as 'EC50.orig')
     if np.isfinite(ec50_xt):
         if x_transform_norm in {"log10", "log"}:
             ec50_orig = float(np.power(10.0, ec50_xt))
@@ -330,15 +279,10 @@ def dr_fit_spline(
     else:
         y_ec50_orig = y_ec50
 
-
-    # --- Residuals and fit quality on raw y ---
     y_fit_at_data = sp(xt)
     residual = y - y_fit_at_data
     rss = float(np.sum(residual ** 2))
-    # k=4 matches Grofit's spline AIC convention (cubic spline ≈ 4 effective params)
     aic = float(aic_from_rss(rss, int(len(y)), 4))
-
-    # --- Effective df of final fit (diagnostic) ---
     df_final = effective_df(sp, xt)
 
     fail_reason = None
@@ -359,11 +303,8 @@ def dr_fit_spline(
         "method": "spline",
         "lam_method": lam_method,
         "lam": lam_out,
-        "s": lam_out,           # backward-compat alias
+        "s": lam_out,
         "effective_df": df_final,
-
-        # Grofit R parity: ec50_x_transformed = xEC50 (in transformed space)
-        #                  ec50 = EC50.orig (in original concentration units)
         "ec50_x_transformed": float(ec50_xt) if np.isfinite(ec50_xt) else float("nan"),
         "ec50": ec50_orig,
         "ec50_status": ec50_status,
@@ -372,10 +313,9 @@ def dr_fit_spline(
         "endpoint_low": y0,
         "endpoint_high": y1,
         "target_response": target,
-
         "dr_monotonic": bool(monotonic),
         "aic": aic,
         "rss": rss,
-        "x_grid": grid,          # in transformed x-space
-        "y_hat": y_hat,          # fitted response values
+        "x_grid": grid,         
+        "y_hat": y_hat,       
     }

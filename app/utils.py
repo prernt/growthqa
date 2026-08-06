@@ -1,24 +1,12 @@
-# app/utils.py
 """
 Pure utility functions used by the Streamlit layer: numeric helpers, label
-normalisation, concentration parsing, and sample-data generators.
-No Streamlit dependency.
-
-Model loading, runtime/version checking and the legacy-pickle alias shim live
-once in the pipeline layer (growthqa.pipelines.infer_labels); they are not
-duplicated here.
+normalisation, concentration parsing and sample-data generators.
 """
 from __future__ import annotations
-
 import re
-
 import numpy as np
 import pandas as pd
 
-
-# ---------------------------------------------------------------------------
-# Numeric helpers
-# ---------------------------------------------------------------------------
 
 def safe_float(x, default=None):
     try:
@@ -39,10 +27,6 @@ def normalize_bootstrap_method(v: object) -> str:
     return s if s in {"pairs", "residual"} else "pairs"
 
 
-# ---------------------------------------------------------------------------
-# Label helpers
-# ---------------------------------------------------------------------------
-
 def normalize_label(v: object) -> str:
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
@@ -55,14 +39,8 @@ def normalize_label(v: object) -> str:
         return "Unsure"
     return str(v).strip()
 
+
 def resolve_display_label(row, *, fallback: str = "") -> str:
-    """
-    Single source of truth for 'what label applies to this curve right now'.
-    Priority: human review (true_label) > combined Stage-1+Stage-2 decision
-    (final_label) > Stage-1-only Pred Label. Used wherever a label needs to
-    be read for display or for deciding what feeds downstream, so all call
-    sites agree on the same order instead of each re-deriving it.
-    """
     getter = row.get if hasattr(row, "get") else (lambda k, d=None: d)
     for key in ("true_label", "True Label", "final_label", "Final Label (S1+S2)", "Pred Label", "pred_label"):
         val = getter(key, None)
@@ -76,10 +54,6 @@ def label_is_valid(label: object) -> bool:
         return False
     return str(label).strip().lower() in {"valid", "true", "1"}
 
-
-# ---------------------------------------------------------------------------
-# Concentration / curve-ID helpers
-# ---------------------------------------------------------------------------
 
 def extract_conc_from_curve_id(curve_id: str) -> float | None:
     """Parse concentration from well headers like ``A01[Conc=0.1]`` or ``A01[0.1]``."""
@@ -101,10 +75,6 @@ def make_curve_key(test_id: str, concentration: object) -> str:
     conc = "" if concentration is None or pd.isna(concentration) else str(concentration)
     return f"{test_id}|{conc}"
 
-
-# ---------------------------------------------------------------------------
-# Sample data generators
-# ---------------------------------------------------------------------------
 
 def make_sample_wide_csv_bytes() -> bytes:
     """Grofit-ready wide-format sample (one row per curve, concentration column)."""

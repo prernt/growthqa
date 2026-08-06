@@ -1,25 +1,22 @@
 from __future__ import annotations
-
 import warnings
 from typing import Dict, Optional
-
 import numpy as np
 import pandas as pd
-
 from growthqa.preprocess.timegrid import parse_time_from_header
 
 
 HAS_SCIPY = False
 _HAS_STATSMODELS = False
 try:
-    from scipy.optimize import OptimizeWarning  # type: ignore
+    from scipy.optimize import OptimizeWarning  
     warnings.filterwarnings("ignore", category=OptimizeWarning)
     _HAS_SCIPY = True
 except Exception:
     _HAS_SCIPY = False
 
 try:
-    from statsmodels.nonparametric.smoothers_lowess import lowess  # type: ignore
+    from statsmodels.nonparametric.smoothers_lowess import lowess
     _HAS_STATSMODELS = True
 except Exception:
     _HAS_STATSMODELS = False
@@ -33,18 +30,6 @@ def baseline_correct_curve(
     clip_negatives: bool,
     baseline_n_points: int = 5,
 ) -> np.ndarray:
-    """
-    Baseline (blank) subtraction.
-
-    Priority:
-      1) If blank_subtracted is False -> return y unchanged
-      2) If global_blank is provided -> subtract that constant
-      3) Else -> subtract robust baseline:
-           - median of earliest baseline_n_points finite observations
-
-    Negative handling:
-      - if clip_negatives True -> clamp corrected values at 0 (only for finite points)
-    """
     if not blank_subtracted:
         return y
 
@@ -54,19 +39,14 @@ def baseline_correct_curve(
     m = np.isfinite(tt) & np.isfinite(yy)
     if not np.any(m):
         return yy
-
-    # 1) constant blank if given
     if global_blank is not None:
         yy[m] = yy[m] - float(global_blank)
     else:
-        # 2) robust baseline from earliest N points (time-sorted)
         idx = np.where(m)[0]
         idx_sorted = idx[np.argsort(tt[idx])]
         k = min(max(int(baseline_n_points), 1), idx_sorted.size)
         base = float(np.nanmedian(yy[idx_sorted[:k]]))
-
         yy[m] = yy[m] - base
-
     if clip_negatives:
         yy[m] = np.maximum(yy[m], 0.0)
 
@@ -89,7 +69,6 @@ def rolling_smooth(y: np.ndarray, window: int) -> np.ndarray:
 
 
 def lowess_smooth(t: np.ndarray, y: np.ndarray, frac: float) -> np.ndarray:
-    # frac is fraction of data used (0..1)
     yy = y.copy()
     m = np.isfinite(yy) & np.isfinite(t)
     if np.sum(m) < 6:
@@ -99,7 +78,6 @@ def lowess_smooth(t: np.ndarray, y: np.ndarray, frac: float) -> np.ndarray:
 
     tt = t[m]
     vv = yy[m]
-    # return sorted, so we need to map back -> simplest: interpolate lowess result onto tt
     lw = lowess(vv, tt, frac=frac, return_sorted=True)
     tt2 = lw[:, 0]
     vv2 = lw[:, 1]
@@ -137,8 +115,6 @@ def smooth_curve(t: np.ndarray, y: np.ndarray, method: str, window: int) -> np.n
     if method in {"SGF"}:
         return savgol_smooth(y, window=int(window))
     if method in {"LWS"}:
-        # map window to frac heuristically
-        # window ~ number of points; frac = window/n
         m = np.isfinite(y)
         n = int(np.sum(m))
         if n <= 0:
@@ -164,9 +140,11 @@ def normalize_curve(y: np.ndarray, mode: str) -> np.ndarray:
     if mode == "MINMAX":
         lo = float(np.nanmin(yy[m]))
         hi = float(np.nanmax(yy[m]))
-        if hi > lo:
+        scale = max(abs(hi), abs(lo), 1e-12)
+        if (hi - lo) > 1e-9 * scale:
             yy[m] = (yy[m] - lo) / (hi - lo)
-        return yy
+        else:
+            yy[m] = 0.0
     return yy
 
 
@@ -189,7 +167,9 @@ def preprocess_wide(raw_wide: pd.DataFrame,
         "Model Name",
         "Is_Valid",
         "too_sparse",
-        "low_resolution",
+        "n_points_observed_raw", 
+        "max_gap_hours_raw", 
+        "missing_frac_on_grid_raw",
         "base_curve_id",
         "aug_id",
         "train_horizon",
@@ -197,6 +177,8 @@ def preprocess_wide(raw_wide: pd.DataFrame,
         "is_censored",
         "source_type",
         "is_synthetic",
+        "gap_augmented",
+        "gap_pattern",
     ]
     meta_cols = [c for c in base_meta_cols if c in raw_wide.columns]
     if "Concentration" in raw_wide.columns and "Concentration" not in meta_cols:
@@ -208,10 +190,7 @@ def preprocess_wide(raw_wide: pd.DataFrame,
 
     for i in range(len(out)):
         y = pd.to_numeric(out.loc[i, time_cols], errors="coerce").to_numpy(dtype=float)
-
         fname = str(out.loc[i, "FileName"]).strip()
-
-        # Determine per-file rule
         entry = blank_status_map.get(fname)
         if entry is None:
             status = blank_default  # "RAW" or "ALREADY"
@@ -219,14 +198,7 @@ def preprocess_wide(raw_wide: pd.DataFrame,
         else:
             status = str(entry["status"])
             per_file_blank = entry.get("blank_value")
-
-        # Apply blank subtraction only if:
-        #  - CLI requested blank subtraction (blank_subtracted=True)
-        #  - AND this file is RAW (not already blank-subtracted)
         apply_blank = bool(blank_subtracted) and (status == "RAW")
-
-        # Choose blank value priority:
-        # per-file blank_value (if provided) > CLI global_blank > first-3-points baseline
         blank_value_to_use = per_file_blank if per_file_blank is not None else global_blank
 
         y0 = baseline_correct_curve(
@@ -237,9 +209,6 @@ def preprocess_wide(raw_wide: pd.DataFrame,
             clip_negatives=bool(clip_negatives),
             baseline_n_points=5,
         )
-
-        # Apply transformations strictly on observed points to avoid borrowing
-        # any information from NaN tails beyond the observed horizon.
         y3 = y0.copy()
         obs = np.isfinite(y0) & np.isfinite(t_grid)
         if np.any(obs):

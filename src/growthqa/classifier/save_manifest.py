@@ -1,20 +1,14 @@
 from __future__ import annotations
-
 import json
 import platform
 from datetime import datetime
 from pathlib import Path
-
 import joblib
 import numpy as np
 import sklearn
 
 
 def write_model_manifest(model_path: str | Path, extra: dict | None = None) -> Path:
-    """
-    Write <model>.manifest.json next to <model>.joblib with runtime versions.
-    This must be called with a MODEL FILE path, not a directory.
-    """
     mp = Path(model_path)
     if mp.suffix.lower() != ".joblib":
         raise ValueError(f"write_model_manifest expects a .joblib file, got: {mp}")

@@ -251,4 +251,5 @@ def attach_validity_from_predictions(
 
     out = out.merge(pred_map, on=[config.out_test_id, config.out_curve_id], how="left")
     out[config.out_is_valid] = out[config.out_is_valid].fillna(bool(default_if_missing)).astype(bool)
+
     return out

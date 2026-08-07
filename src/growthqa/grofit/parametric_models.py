@@ -150,6 +150,7 @@ def extract_grofit_params_from_curve(
     t_max: float,
     params: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
+
     t_grid = np.linspace(t_min, t_max, 400)
     y_grid = fitted_func(t_grid)
     y0_geo = float(np.nanmean(y_grid[:3])) if y_grid.size >= 3 else float(y_grid[0])
@@ -159,4 +160,5 @@ def extract_grofit_params_from_curve(
     lag    = _estimate_lag_from_tangent(t_star, y_star, mu, y0_geo)
     integral = float(np.trapezoid(y_grid, t_grid)) if hasattr(np, "trapezoid") else float(np.trapz(y_grid, t_grid))
     A_est = extract_A_from_params(model_name, params) if params is not None else float(np.nanmax(y_grid) - y0_geo)
+
     return {"mu": mu, "lambda": lag, "A": A_est, "integral": integral}

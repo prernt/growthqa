@@ -8,8 +8,7 @@ from growthqa.io.long_format import standardize_long
 from growthqa.io.time_parse import (
     infer_and_convert_numeric_time_to_hours,
     parse_time_any_to_hours,
-    split_condition_and_well,
-)
+    split_condition_and_well,)
 
 
 def parse_plate_xlsx(path: str, sheet_name=0) -> Optional[pd.DataFrame]:

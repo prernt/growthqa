@@ -25,7 +25,7 @@ def parse_time_any_to_hours(x) -> float:
         return np.nan
 
     if isinstance(x, (int, float, np.integer, np.floating)):
-        return float(x)  # treated as 'raw time'; unit inference can adjust later
+        return float(x) 
 
     s = str(x).strip().lower()
     if s in {"t0", "to", "t 0", "0"}:

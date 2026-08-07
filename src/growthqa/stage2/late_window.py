@@ -1,3 +1,4 @@
+#Stage 2 evidence-based checker for growth curves, focusing on late-window data to assess growth, artifacts and decline.
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Any

@@ -24,7 +24,6 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
-
 from growthqa.classifier.save_manifest import write_model_manifest
 from growthqa.config import (
     ROOT,
@@ -32,12 +31,12 @@ from growthqa.config import (
     MODEL_DIR as ART_DIR,
     LOCKFILE_OUT,
     RANDOM_STATE,
-    STAGE1_FEATURE_GROUPS,
     STAGE1_CANDIDATE_POOL,
     STAGE1_SELECTED_FEATURES,
     IDENTIFIER_COLS,
     LEAKAGE_COLS,
 )
+
 np.random.seed(RANDOM_STATE)
 
 

@@ -1,3 +1,4 @@
+#synthetic growth-curve generator for GrowthQA, producing wide-format CSV and run info XLSX.
 from __future__ import annotations
 import argparse
 import logging

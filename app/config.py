@@ -33,7 +33,6 @@ class InferenceSettings:
     auto_tmax: bool = False
     auto_tmax_coverage: float = 0.8
     tmax_hours: float | None = _TMAX_HOURS
-
     # Locked values
     clip_negatives: bool = False
     smooth_method: str = _SMOOTH_METHOD

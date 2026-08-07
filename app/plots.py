@@ -86,7 +86,6 @@ def make_overlay_plot_payload(
     TANGENT_COL= "#8b4513"                   # brown
     BOOT_LINE= "rgba(128,0,128,0.95)"
     BOOT_FILL= "rgba(128,0,128,0.36)"
-
     t_raw= payload.get("t_raw",  np.array([]))
     y_raw= payload.get("y_raw",  np.array([]))
     t_proc= payload.get("t_proc", np.array([]))

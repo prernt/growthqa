@@ -26,7 +26,7 @@ def show_friendly_error(exc: Exception) -> None:
         background:#ffecec;color:#600;font-size:17px;font-weight:700;">
         Run failed. Please write what you were doing and send the issue details/logs
         to <a href="mailto:theprerna@uni-koblenz.de">theprerna@uni-koblenz.de</a>
-        for improvement and feedback.</div>""",
+        for improvement and feedback. </div>""",
         unsafe_allow_html=True,
     )
     st.caption(f"Error: {type(exc).__name__}: {exc}")

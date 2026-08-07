@@ -169,7 +169,6 @@ def render_results(results: dict) -> None:
     curve_df["_filter_label"]= curve_df.apply(
         lambda r: resolve_display_label(r, fallback=str(r.get(pred_col, ""))), axis=1,
     )
-
     # ---- summary metrics ----
     st.markdown("---")
     st.markdown(f"### {'MANUAL MODE' if manual_review_mode else 'AUTO MODE'}")

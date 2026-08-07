@@ -10,11 +10,9 @@ from config import MODEL_DIR
 # Single source of truth for these helpers is the pipeline layer.
 from growthqa.pipelines.infer_labels import (
     discover_models,
-    label_from_stem,
-)
+    label_from_stem,)
 from growthqa.pipelines.auto_train_classifier import (
-    train_classifier_from_meta_file,
-)
+    train_classifier_from_meta_file,)
 
 __all__ = [
     "has_trained_models",

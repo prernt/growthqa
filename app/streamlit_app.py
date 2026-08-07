@@ -16,15 +16,13 @@ from utils import (
 )
 from model_io import (
     has_trained_models,
-    train_classifier_from_meta_file,
-)
+    train_classifier_from_meta_file,)
 from data import (
     build_classifier_output,
     build_grofit_input_df,
     build_export_zip,
     init_review_df,
-    wide_to_grofit_tidy,
-)
+    wide_to_grofit_tidy,)
 from styles import inject_css
 from components import show_friendly_error
 from sidebar import render_top_controls

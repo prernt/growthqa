@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 import streamlit as st
 from config import GrofitOptions, InferenceSettings, MODEL_DIR
-from utils import make_sample_wide_csv_bytes, make_sample_long_csv_bytes, safe_float, normalize_bootstrap_method
+from utils import make_sample_wide_csv_bytes, make_sample_long_csv_bytes, normalize_bootstrap_method
 from model_io import has_trained_models, discover_models, label_from_stem
 
 
